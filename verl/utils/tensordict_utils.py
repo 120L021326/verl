@@ -337,12 +337,14 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
             for i, chunk_td in enumerate(tds):
                 chunk_lengths = lengths[i * chunk_size : (i + 1) * chunk_size]
                 chunk_tensors = [padded_chunks[i][j, :seq_len] for j, seq_len in enumerate(chunk_lengths)]
-                chunk_td[key] = torch.nested.as_nested_tensor(chunk_tensors, layout=torch.jagged)
+                chunk_td[key] = _fix_nested_position_ids_tensor(
+                    key, torch.nested.as_nested_tensor(chunk_tensors, layout=torch.jagged)
+                )
             continue
 
         for i, chunk_td in enumerate(tds):
-            chunk_td[key] = torch.nested.as_nested_tensor(
-                tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged
+            chunk_td[key] = _fix_nested_position_ids_tensor(
+                key, torch.nested.as_nested_tensor(tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged)
             )
 
     return tds
@@ -467,8 +469,8 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
                 tensor_lst = tensor.unbind()  # for performance
-                data_dict[key] = torch.nested.as_nested_tensor(
-                    [tensor_lst[idx] for idx in indices], layout=torch.jagged
+                data_dict[key] = _fix_nested_position_ids_tensor(
+                    key, torch.nested.as_nested_tensor([tensor_lst[idx] for idx in indices], layout=torch.jagged)
                 )
             else:
                 # This handles NonTensorStack (indexable by batch dim) and NonTensorData (scalar metadata).
@@ -477,6 +479,7 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
                 else:
                     data_dict[key] = tensor
         selected_batch = TensorDict(source=data_dict, batch_size=batch_size)
+        maybe_fix_3d_position_ids(selected_batch)
     else:
         selected_batch = None
 
@@ -886,6 +889,12 @@ def maybe_fix_3d_position_ids(data: TensorDict):
     # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
         data["position_ids"]._ragged_idx = 2
+
+
+def _fix_nested_position_ids_tensor(key: str, tensor: torch.Tensor) -> torch.Tensor:
+    if key == "position_ids" and tensor.is_nested and tensor.dim() == 3:
+        tensor._ragged_idx = 2
+    return tensor
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:

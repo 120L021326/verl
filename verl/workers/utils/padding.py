@@ -64,10 +64,15 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
         else:  # (4, seq_len)
             valid_ids = curr_pos_ids[:, curr_mask]
         position_ids_list.append(valid_ids)
-    position_ids_nested = torch.nested.as_nested_tensor(position_ids_list, layout=torch.jagged)
 
     data["input_ids"] = input_ids_nested
-    data["position_ids"] = position_ids_nested
+    # Avoid 3D jagged NestedTensor for mRoPE position_ids. PyTorch may expose an
+    # unstable internal layout for tensors with per-sample shape (4, seq_len),
+    # which later corrupts values/lengths when consumers touch .values().
+    if position_ids.dim() == 1:
+        data["position_ids"] = torch.nested.as_nested_tensor(position_ids_list, layout=torch.jagged)
+    else:
+        data["position_ids"] = position_ids
     data["loss_mask"] = data["response_mask"]
 
     routed_experts = data.get("routed_experts", None)

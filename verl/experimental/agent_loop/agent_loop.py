@@ -59,6 +59,38 @@ from verl.workers.rollout.replica import DiffusionOutput, TokenOutput, get_rollo
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+def _is_qwen3_vl_debug_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_QWEN3_VL", "0").lower() in {"1", "true", "yes"}
+
+
+def _shape_or_none(value: Any) -> Any:
+    if value is None:
+        return None
+    return tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+
+
+def _token_positions(input_ids: torch.Tensor, token_id: Optional[int]) -> list[int]:
+    if token_id is None or token_id < 0:
+        return []
+    if input_ids.dim() == 2:
+        input_ids = input_ids.squeeze(0)
+    return torch.nonzero(input_ids == token_id, as_tuple=False).flatten().tolist()
+
+
+def _is_qwen3_vl_processor(processor: Any) -> bool:
+    processor_name = processor.__class__.__name__
+    model_type = getattr(getattr(processor, "config", None), "model_type", None)
+    image_processor = getattr(processor, "image_processor", None)
+    image_processor_name = image_processor.__class__.__name__ if image_processor is not None else ""
+    logger.warning(
+        "processor_name: %s, model_type: %s, image_processor_name: %s",
+        processor_name,
+        model_type,
+        image_processor_name,
+    )
+    return processor_name == "Qwen3VLProcessor" or model_type in {"qwen3_vl", "qwen3_vl_moe"}
+
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
@@ -504,6 +536,7 @@ class AgentLoopWorker:
 
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
+        self.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
 
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path
         if agent_loop_config_path:
@@ -736,7 +769,7 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids, kwargs["raw_prompt"], output.prompt_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
         await self._compute_score(
             output,
@@ -791,7 +824,7 @@ class AgentLoopWorker:
             extra_fields=output.extra_fields,
         )
 
-    def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
+    def _compute_multi_modal_inputs(self, output, input_ids, raw_prompt, prompt_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
         multi_modal_inputs = {}
         if self.processor is None:
@@ -805,8 +838,24 @@ class AgentLoopWorker:
             videos, video_metadatas = list(videos), list(video_metadatas)
         else:
             video_metadatas = None
-        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-        multi_modal_inputs = self.processor(
+
+        current_text = apply_chat_template(
+            self.processor,
+            raw_prompt,
+            add_generation_prompt=True,
+            tokenize=False,
+            **self.apply_chat_template_kwargs,
+        )
+        if _is_qwen3_vl_debug_enabled():
+            logger.warning(
+                "Qwen3-VL debug before processor rebuild: input_ids_shape=%s prompt_ids_len=%s images=%s videos=%s rebuilt_prompt_prefix=%r",
+                tuple(input_ids.shape),
+                len(prompt_ids),
+                len(images) if images is not None else 0,
+                len(videos) if videos is not None else 0,
+                current_text[:300],
+            )
+        processor_outputs = self.processor(
             text=[current_text],
             images=images,
             videos=videos,
@@ -814,6 +863,23 @@ class AgentLoopWorker:
             return_tensors="pt",
             do_sample_frames=False,
         )
+        if _is_qwen3_vl_debug_enabled():
+            rebuilt_input_ids = processor_outputs.get("input_ids")
+            prompt_ids_tensor = torch.tensor(prompt_ids, dtype=input_ids.dtype, device=input_ids.device).unsqueeze(0)
+            original_vision_start_positions = _token_positions(prompt_ids_tensor, getattr(self.processor, "vision_start_token_id", None))
+            rebuilt_vision_start_positions = _token_positions(rebuilt_input_ids, getattr(self.processor, "vision_start_token_id", None))
+            original_image_positions = _token_positions(prompt_ids_tensor, getattr(self.processor, "image_token_id", None))
+            rebuilt_image_positions = _token_positions(rebuilt_input_ids, getattr(self.processor, "image_token_id", None))
+            logger.warning(
+                "Qwen3-VL debug token alignment: rebuilt_input_ids_shape=%s original_vision_start_positions=%s rebuilt_vision_start_positions=%s original_image_positions=%s rebuilt_image_positions=%s",
+                _shape_or_none(rebuilt_input_ids),
+                original_vision_start_positions,
+                rebuilt_vision_start_positions,
+                original_image_positions,
+                rebuilt_image_positions,
+            )
+
+        multi_modal_inputs = processor_outputs
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)
 
@@ -824,6 +890,15 @@ class AgentLoopWorker:
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
             multi_modal_inputs["images_seqlens"] = images_seqlens
+        if _is_qwen3_vl_debug_enabled():
+            logger.warning(
+                "Qwen3-VL debug after processor rebuild: pixel_values=%s image_grid_thw=%s video_grid_thw=%s mm_token_type_ids=%s images_seqlens=%s",
+                _shape_or_none(multi_modal_inputs.get("pixel_values")),
+                _shape_or_none(multi_modal_inputs.get("image_grid_thw")),
+                _shape_or_none(multi_modal_inputs.get("video_grid_thw")),
+                _shape_or_none(multi_modal_inputs.get("mm_token_type_ids")),
+                _shape_or_none(multi_modal_inputs.get("images_seqlens")),
+            )
         return multi_modal_inputs
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
@@ -850,11 +925,25 @@ class AgentLoopWorker:
         )
         vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
 
+        # if _is_qwen3_vl_processor(self.processor):
+        #     position_ids = vision_position_ids
+        #     logger.warning("Use Qwen3-VL processor's get_rope_index output as final position ids for debugging.")
+        # else:
         valid_mask = attention_mask[0].bool()
         text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
         text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
         text_position_ids = text_position_ids.unsqueeze(0)
         position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
+        if _is_qwen3_vl_debug_enabled():
+            logger.warning(
+                "Qwen3-VL debug position ids: input_ids=%s attention_mask=%s image_grid_thw=%s video_grid_thw=%s vision_position_ids=%s final_position_ids=%s",
+                tuple(input_ids.shape),
+                tuple(attention_mask.shape),
+                _shape_or_none(multi_modal_inputs.get("image_grid_thw")),
+                _shape_or_none(multi_modal_inputs.get("video_grid_thw")),
+                tuple(vision_position_ids.shape),
+                tuple(position_ids.shape),
+            )
         return position_ids
 
     async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):

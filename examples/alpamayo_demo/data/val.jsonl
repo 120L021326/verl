@@ -1,0 +1,1 @@
+{"data_source":"alpamayo_demo","instruction":"Explain the near-term driving rationale inside the CoT markers, then emit the future trajectory start token.","fused_history":"speed=5.4m/s; lane=center; stop_sign_visible=true; cross_traffic=false; steering=-0.01rad","ground_truth":"","extra_info":{"index":0}}

@@ -81,6 +81,60 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _is_qwen3_vl_debug_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_QWEN3_VL", "0").lower() in {"1", "true", "yes"}
+
+
+def _shape_or_none(value):
+    if value is None:
+        return None
+    return tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+
+
+def _tensor_preview(value, limit: int = 8):
+    if value is None or not hasattr(value, "numel"):
+        return None
+    if value.numel() == 0:
+        return []
+    flat = value.detach().reshape(-1)
+    limit = min(limit, flat.numel())
+    return flat[:limit].cpu().tolist()
+
+
+def _rebuild_3d_position_ids_rmpad(position_ids: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    assert position_ids.is_nested and input_ids.is_nested, "expected nested tensors for remove-padding rebuild"
+    assert position_ids.dim() == 3, f"expected 3D position_ids, got {position_ids.dim()}"
+
+    seq_lengths = input_ids.offsets().diff().tolist()
+    batch_size = len(seq_lengths)
+    num_channels = position_ids.shape[1]
+    max_seq_len = max(seq_lengths) if seq_lengths else 0
+
+    # Avoid position_ids.values() for 3D jagged tensors: on some ranks it can
+    # expose an internal layout whose last dimension is no longer the true seq_len.
+    position_ids_padded = torch.nested.to_padded_tensor(
+        position_ids, padding=0, output_size=(batch_size, num_channels, max_seq_len)
+    )
+    chunks = [position_ids_padded[i, :, :seq_len] for i, seq_len in enumerate(seq_lengths) if seq_len > 0]
+    if chunks:
+        return torch.cat(chunks, dim=-1).unsqueeze(1)
+    return position_ids_padded.new_empty((num_channels, 1, 0))
+
+
+def _slice_dense_3d_position_ids_rmpad(position_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    assert position_ids.dim() == 3 and not position_ids.is_nested, "expected dense 3D position_ids"
+    assert attention_mask is not None, "attention_mask is required for dense 3D position_ids"
+
+    chunks = []
+    for i in range(position_ids.shape[0]):
+        curr_mask = attention_mask[i].bool()
+        chunks.append(position_ids[i, :, curr_mask])
+
+    if chunks:
+        return torch.cat(chunks, dim=-1).unsqueeze(1)
+    return position_ids.new_empty((position_ids.shape[1], 1, 0))
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -885,6 +939,29 @@ class FSDPEngineWithLMHead(FSDPEngine):
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
+        attention_mask = micro_batch.get("attention_mask", None)
+
+        if _is_qwen3_vl_debug_enabled():
+            pos_values = position_ids.values() if isinstance(position_ids, torch.Tensor) and position_ids.is_nested else None
+            pos_offsets = position_ids.offsets() if isinstance(position_ids, torch.Tensor) and position_ids.is_nested else None
+            in_values = input_ids.values() if isinstance(input_ids, torch.Tensor) and input_ids.is_nested else None
+            logger.warning(
+                "Qwen3-VL engine debug pre-rmpad: pid=%s rank=%s use_remove_padding=%s use_ulysses_sp=%s sp_size=%s input_ids=%s input_values=%s input_offsets=%s position_ids=%s pos_nested=%s pos_ragged_idx=%s pos_values=%s pos_offsets=%s pos_values_preview=%s",
+                os.getpid(),
+                self.rank,
+                use_remove_padding,
+                self.use_ulysses_sp,
+                self.ulysses_sequence_parallel_size,
+                _shape_or_none(input_ids),
+                _shape_or_none(in_values),
+                _tensor_preview(input_ids.offsets()) if isinstance(input_ids, torch.Tensor) and input_ids.is_nested else None,
+                _shape_or_none(position_ids),
+                bool(isinstance(position_ids, torch.Tensor) and position_ids.is_nested),
+                getattr(position_ids, "_ragged_idx", None),
+                _shape_or_none(pos_values),
+                _tensor_preview(pos_offsets),
+                _tensor_preview(pos_values),
+            )
 
         if not isinstance(temperature, torch.Tensor):
             temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
@@ -905,11 +982,29 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids_rmpad = input_ids.values().unsqueeze(0)  # (1, total_nnz)
                 if position_ids.dim() == 3:
-                    position_ids_rmpad = position_ids.values().unsqueeze(1)  # (4, 1, total_nnz)
+                    if position_ids.is_nested:
+                        position_ids_rmpad = _rebuild_3d_position_ids_rmpad(
+                            position_ids=position_ids, input_ids=input_ids
+                        )  # (4, 1, total_nnz)
+                    else:
+                        position_ids_rmpad = _slice_dense_3d_position_ids_rmpad(
+                            position_ids=position_ids, attention_mask=attention_mask
+                        )  # (4, 1, total_nnz)
                 else:
                     position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+
+            if _is_qwen3_vl_debug_enabled():
+                logger.warning(
+                    "Qwen3-VL engine debug post-rmpad: pid=%s rank=%s input_ids_rmpad=%s input_ids_rmpad_preview=%s position_ids_rmpad=%s position_ids_rmpad_preview=%s",
+                    os.getpid(),
+                    self.rank,
+                    _shape_or_none(input_ids_rmpad),
+                    _tensor_preview(input_ids_rmpad),
+                    _shape_or_none(position_ids_rmpad),
+                    _tensor_preview(position_ids_rmpad),
+                )
 
             # for compute the log_prob
             input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)

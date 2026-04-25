@@ -15,10 +15,12 @@
 import functools
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import transformers.models.qwen3_vl.modeling_qwen3_vl as hf_qwen3_vl
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLCausalLMOutputWithPast,
     Qwen3VLForConditionalGeneration,
@@ -28,6 +30,176 @@ from verl.utils.transformers_compat import unpack_visual_output
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _is_qwen3_vl_debug_enabled() -> bool:
+    return os.getenv("VERL_DEBUG_QWEN3_VL", "0").lower() in {"1", "true", "yes"}
+
+
+def _get_pid_rank() -> tuple[int, Optional[int]]:
+    rank = None
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    return os.getpid(), rank
+
+
+def _shape_or_none(value):
+    if value is None:
+        return None
+    return tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+
+
+def _tensor_preview(value: Optional[torch.Tensor], limit: int = 8):
+    if value is None or not hasattr(value, "shape"):
+        return None
+    if value.numel() == 0:
+        return []
+    flat = value.detach().reshape(-1)
+    limit = min(limit, flat.numel())
+    return flat[:limit].cpu().tolist()
+
+
+def _stride_or_none(value):
+    if value is None or not hasattr(value, "stride"):
+        return None
+    return tuple(value.stride())
+
+
+def _should_force_rotary_log(x, position_ids=None, cos=None) -> bool:
+    x_shape = _shape_or_none(x)
+    pos_shape = _shape_or_none(position_ids)
+    cos_shape = _shape_or_none(cos)
+
+    if pos_shape is not None and isinstance(pos_shape, tuple) and len(pos_shape) >= 1:
+        if pos_shape[-1] <= 16:
+            return True
+    if cos_shape is not None and isinstance(cos_shape, tuple) and len(cos_shape) >= 1:
+        if cos_shape[-1] <= 16 or (len(cos_shape) >= 2 and cos_shape[1] <= 16):
+            return True
+    if (
+        x_shape is not None
+        and pos_shape is not None
+        and isinstance(x_shape, tuple)
+        and isinstance(pos_shape, tuple)
+        and len(x_shape) >= 2
+        and len(pos_shape) >= 1
+        and x_shape[1] != pos_shape[-1]
+    ):
+        return True
+    if (
+        x_shape is not None
+        and cos_shape is not None
+        and isinstance(x_shape, tuple)
+        and isinstance(cos_shape, tuple)
+        and len(x_shape) >= 2
+        and len(cos_shape) >= 2
+        and x_shape[1] != cos_shape[1]
+    ):
+        return True
+    return False
+
+
+def _maybe_patch_rotary_debug(language_model) -> None:
+    if getattr(language_model, "_verl_rotary_debug_patched", False):
+        return
+
+    original_rotary_forward = language_model.rotary_emb.forward
+
+    @functools.wraps(original_rotary_forward)
+    def rotary_forward_with_debug(*args, **kwargs):
+        position_ids = kwargs.get("position_ids")
+        x = kwargs.get("x")
+        if x is None and len(args) >= 1:
+            x = args[0]
+        if position_ids is None and len(args) >= 2:
+            position_ids = args[1]
+
+        pid, rank = _get_pid_rank()
+        logger.warning(
+            "Qwen3-VL rotary debug enter: pid=%s rank=%s x=%s x_preview=%s position_ids=%s position_ids_preview=%s",
+            pid,
+            rank,
+            _shape_or_none(x),
+            _tensor_preview(x),
+            _shape_or_none(position_ids),
+            _tensor_preview(position_ids),
+        )
+        if _should_force_rotary_log(x, position_ids=position_ids):
+            enter_message = (
+                "Qwen3-VL rotary debug suspicious enter: "
+                f"pid={pid} rank={rank} "
+                f"x={_shape_or_none(x)} x_stride={_stride_or_none(x)} "
+                f"position_ids={_shape_or_none(position_ids)} position_ids_stride={_stride_or_none(position_ids)} "
+                f"x_preview={_tensor_preview(x)} position_ids_preview={_tensor_preview(position_ids)}"
+            )
+            logger.error(enter_message)
+            print(enter_message, file=sys.stderr, flush=True)
+        cos, sin = original_rotary_forward(*args, **kwargs)
+        logger.warning(
+            "Qwen3-VL rotary debug exit: pid=%s rank=%s cos=%s sin=%s cos_preview=%s",
+            pid,
+            rank,
+            _shape_or_none(cos),
+            _shape_or_none(sin),
+            _tensor_preview(cos),
+        )
+        if _should_force_rotary_log(x, position_ids=position_ids, cos=cos):
+            exit_message = (
+                "Qwen3-VL rotary debug suspicious exit: "
+                f"pid={pid} rank={rank} "
+                f"x={_shape_or_none(x)} x_stride={_stride_or_none(x)} "
+                f"position_ids={_shape_or_none(position_ids)} position_ids_stride={_stride_or_none(position_ids)} "
+                f"cos={_shape_or_none(cos)} cos_stride={_stride_or_none(cos)} "
+                f"sin={_shape_or_none(sin)} sin_stride={_stride_or_none(sin)} "
+                f"position_ids_preview={_tensor_preview(position_ids)} cos_preview={_tensor_preview(cos)}"
+            )
+            logger.error(exit_message)
+            print(exit_message, file=sys.stderr, flush=True)
+        return cos, sin
+
+    language_model.rotary_emb.forward = rotary_forward_with_debug
+    language_model._verl_rotary_debug_patched = True
+
+    if not getattr(hf_qwen3_vl, "_verl_apply_rotary_debug_patched", False):
+        original_apply_rotary = hf_qwen3_vl.apply_rotary_pos_emb
+
+        @functools.wraps(original_apply_rotary)
+        def apply_rotary_pos_emb_with_debug(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            pid, rank = _get_pid_rank()
+            logger.warning(
+                "Qwen3-VL apply_rotary debug enter: pid=%s rank=%s q=%s k=%s cos=%s sin=%s q_preview=%s cos_preview=%s unsqueeze_dim=%s",
+                pid,
+                rank,
+                _shape_or_none(q),
+                _shape_or_none(k),
+                _shape_or_none(cos),
+                _shape_or_none(sin),
+                _tensor_preview(q),
+                _tensor_preview(cos),
+                unsqueeze_dim,
+            )
+            try:
+                return original_apply_rotary(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+            except RuntimeError:
+                error_message = (
+                    "Qwen3-VL apply_rotary debug error: "
+                    f"pid={pid} rank={rank} "
+                    f"q={_shape_or_none(q)} q_stride={_stride_or_none(q)} "
+                    f"k={_shape_or_none(k)} k_stride={_stride_or_none(k)} "
+                    f"cos={_shape_or_none(cos)} cos_stride={_stride_or_none(cos)} "
+                    f"sin={_shape_or_none(sin)} sin_stride={_stride_or_none(sin)} "
+                    f"position_ids={_shape_or_none(position_ids)} "
+                    f"position_ids_preview={_tensor_preview(position_ids)} "
+                    f"q_preview={_tensor_preview(q)} "
+                    f"cos_preview={_tensor_preview(cos)} "
+                    f"unsqueeze_dim={unsqueeze_dim}"
+                )
+                logger.error(error_message)
+                print(error_message, file=sys.stderr, flush=True)
+                raise
+
+        hf_qwen3_vl.apply_rotary_pos_emb = apply_rotary_pos_emb_with_debug
+        hf_qwen3_vl._verl_apply_rotary_debug_patched = True
 
 
 def get_rope_index(
@@ -152,6 +324,15 @@ def _get_input_embeds(
         image_embeds, deepstack_image_embeds = unpack_visual_output(model.visual(pixel_values, grid_thw=image_grid_thw))
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
+        if _is_qwen3_vl_debug_enabled():
+            logger.warning(
+                "Qwen3-VL forward debug image alignment: input_ids=%s pixel_values=%s image_grid_thw=%s n_image_tokens=%s n_image_features=%s",
+                tuple(input_ids.shape),
+                _shape_or_none(pixel_values),
+                _shape_or_none(image_grid_thw),
+                n_image_tokens,
+                n_image_features,
+            )
         if n_image_tokens != n_image_features:
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
@@ -252,6 +433,23 @@ def qwen3_vl_base_forward(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
     kwargs.update(input_kwargs)
+    if _is_qwen3_vl_debug_enabled():
+        _maybe_patch_rotary_debug(self.language_model)
+        pid, rank = _get_pid_rank()
+    if _is_qwen3_vl_debug_enabled():
+        logger.warning(
+            "Qwen3-VL forward debug before language_model: pid=%s rank=%s input_ids=%s attention_mask=%s position_ids=%s position_ids_preview=%s pixel_values=%s pixel_values_videos=%s image_grid_thw=%s video_grid_thw=%s",
+            pid,
+            rank,
+            tuple(input_ids.shape) if input_ids is not None else None,
+            _shape_or_none(attention_mask),
+            _shape_or_none(kwargs.get("position_ids")),
+            _tensor_preview(kwargs.get("position_ids")),
+            _shape_or_none(pixel_values),
+            _shape_or_none(pixel_values_videos),
+            _shape_or_none(image_grid_thw),
+            _shape_or_none(video_grid_thw),
+        )
     return self.language_model(
         input_ids=None,
         **kwargs,
