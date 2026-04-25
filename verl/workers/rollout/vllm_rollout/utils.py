@@ -260,24 +260,8 @@ class vLLMColocateWorkerExtension:
                 loaded_params = load_quanted_weights(weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
-                load_config = getattr(self.model_runner.vllm_config, "load_config", None)
-                load_format = str(getattr(load_config, "load_format", ""))
-                if "dtensor" in load_format:
-                    logger.info("Loading dtensor weights (non-FP8, async)")
-                    from verl.third_party.vllm.dtensor_weight_loaders import load_dtensor_weights
-
-                    load_dtensor_weights(weights, self.model_runner.model)
-                else:
-                    from verl.third_party.vllm.dtensor_weight_loaders import has_dtensor_weights
-
-                    if has_dtensor_weights(weights):
-                        logger.info("Loading detected DTensor weights (non-FP8, async)")
-                        from verl.third_party.vllm.dtensor_weight_loaders import load_dtensor_weights
-
-                        load_dtensor_weights(weights, self.model_runner.model)
-                    else:
-                        logger.info("Loading standard weights (non-FP8, async)")
-                        self.model_runner.model.load_weights(weights)
+                logger.info("Loading standard weights (non-FP8, async)")
+                self.model_runner.model.load_weights(weights)
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
