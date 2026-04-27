@@ -346,3 +346,1500 @@ verl 里用它来存 `position_ids`，然而因为 mRoPE 的 `position_ids` 是 
   - 用 `attention_mask` 从 `(bs,4,seq)` 显式切成 `(4,1,total_nnz)`
   解决的问题：
   - 让上面 `padding.py` 的新数据形态能在 engine 里继续工作，不再依赖 nested 3D `position_ids`。
+
+### agent loop 相关结构
+rollout 框架为三层：
+
+```text
+RayPPOTrainer
+  -> AgentLoopManager      管一批 rollout worker，负责分发 batch
+      -> AgentLoopWorker   Ray actor，负责处理一小块 batch
+          -> AgentLoop     单条样本的交互逻辑，比如 SingleTurnAgentLoop
+              -> server_manager.generate(...) 真正请求 rollout 模型生成
+```
+
+**1. AgentLoop 是什么**
+
+`AgentLoop` 是“单条样本怎么和模型交互”的逻辑单元。
+
+在 alpamayo demo 里，默认用的是 `single_turn_agent`，对应 [SingleTurnAgentLoop.run](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\single_turn_agent_loop.py:44>)。
+
+它做的事情是单样本级别的：
+
+```python
+messages = kwargs["raw_prompt"]
+multi_modal_data = await self.process_vision_info(messages)
+prompt_ids = await self.apply_chat_template(messages, images=..., videos=...)
+output = await self.server_manager.generate(...)
+return AgentLoopOutput(...)
+```
+
+也就是说，`AlpamayoDemoDataset.__getitem__()` 产出的 `raw_prompt`，真正是在 `SingleTurnAgentLoop.run()` 里被处理成：
+
+- images
+- videos
+- prompt token ids
+- rollout response token ids
+
+如果以后是工具调用、多轮对话、环境交互，换的也是这一层。例如 `ToolAgentLoop` 会在这里处理 tool call。
+
+**2. AgentLoopWorker 是什么**
+
+`AgentLoopWorker` 是 Ray actor，负责处理一个 batch chunk。
+
+位置是 [agent_loop.py::AgentLoopWorker.generate_sequences](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:561>)。
+
+它收到的是一个 `DataProto`，里面有多条样本。它会：
+
+1. 遍历 batch 里的每条样本。
+2. 把每条样本的 `non_tensor_batch` 拆成 `kwargs`。
+3. 根据 `agent_name` 找到具体 AgentLoop 类。默认是 `single_turn_agent`。
+4. 为每条样本创建一个 AgentLoop 实例。
+5. 调用：
+
+```python
+self._run_agent_loop(..., **kwargs)
+```
+
+然后 `_run_agent_loop()` 里会实例化具体 agent：
+
+```python
+agent_loop = hydra.utils.instantiate(...)
+output = await agent_loop.run(sampling_params, **kwargs)
+```
+
+所以关系是：
+
+```text
+AgentLoopWorker 管多条样本
+AgentLoop 只处理其中一条样本
+```
+
+Worker 还负责把每条样本的输出做 postprocess：
+
+- pad prompt
+- pad response
+- 拼 `input_ids = prompt + response`
+- 生成 `attention_mask`
+- 生成 `position_ids`
+- 重建 `multi_modal_inputs`
+- 调 reward loop 计算 reward
+
+这些在 [AgentLoopWorker._agent_loop_postprocess](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:677>)。
+
+**3. AgentLoopManager 是什么**
+
+`AgentLoopManager` 是 trainer 侧的 rollout 管理器。
+
+位置是 [agent_loop.py::AgentLoopManager.generate_sequences](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:1281>)。
+
+它不处理单条样本细节，只负责调度：
+
+```python
+chunkes = prompts.chunk(len(self.agent_loop_workers))
+outputs = await asyncio.gather(
+    worker.generate_sequences.remote(chunk)
+    for worker, chunk in zip(...)
+)
+output = DataProto.concat(outputs)
+```
+
+所以它的职责是：
+
+- 管理一组 `AgentLoopWorker`
+- 把 `DataProto` batch 切块
+- 并发发给 worker
+- 收集 worker 返回的 `DataProto`
+- 合并成完整 rollout output
+
+在 trainer 中，创建位置是 [RayPPOTrainer.init_workers](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:862>)：
+
+```python
+self.async_rollout_manager = AgentLoopManager.create(...)
+```
+
+训练时调用位置是 [RayPPOTrainer.fit](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1372>)：
+
+```python
+gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+```
+
+**4. server_manager.generate 是什么**
+
+`server_manager.generate(...)` 是 AgentLoop 里真正“让模型生成”的接口。
+
+在 [SingleTurnAgentLoop.run](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\single_turn_agent_loop.py:62>)：
+
+```python
+output = await self.server_manager.generate(
+    request_id=uuid4().hex,
+    prompt_ids=prompt_ids,
+    sampling_params=sampling_params,
+    image_data=images,
+    video_data=videos,
+)
+```
+
+它不是 reward，也不是 dataset，也不是 actor update。它就是向 rollout backend 发生成请求。
+
+在 alpamayo demo 里，你设置了：
+
+```bash
+actor_rollout_ref.rollout.name="$ENGINE"
+```
+
+默认 `ENGINE=vllm`。因此 `server_manager.generate()` 最终会把：
+
+- `prompt_ids`
+- images
+- videos
+- sampling params
+
+发给 vLLM rollout 服务，返回：
+
+- generated token ids
+- logprobs，如果配置需要
+- routed experts，如果有
+- extra fields
+
+可以把它理解成 verl 内部封装的“异步 LLM 生成客户端”。
+### alpamayo demo 训练流程
+下面按当前 `examples/alpamayo_demo/run_qwen3_vl_alpamayo_demo.sh` 和现有代码讲，从初始化到一次训练 step 的完整流程。
+
+**0. 启动脚本**
+
+入口是：
+
+```bash
+python3 -m verl.trainer.main_ppo \
+  algorithm.adv_estimator=grpo \
+  data.train_files="$TRAIN_FILE" \
+  data.val_files="$VAL_FILE" \
+  data.custom_cls.path="$EXAMPLE_DIR/dataset.py" \
+  data.custom_cls.name=AlpamayoDemoDataset \
+  reward.custom_reward_function.path="$EXAMPLE_DIR/reward_fn.py" \
+  reward.custom_reward_function.name=compute_score \
+  actor_rollout_ref.rollout.name="$ENGINE" \
+  ...
+```
+
+这里 Hydra 会加载默认配置 [ppo_trainer.yaml](<E:\学习历程\RL_project\verl\verl\trainer\config\ppo_trainer.yaml:1>)，再用脚本里的命令行参数覆盖。对 alpamayo demo 最关键的是：
+
+- 数据集类被替换成 `AlpamayoDemoDataset`
+- reward 函数被替换成 `examples/alpamayo_demo/reward_fn.py::compute_score`
+- 算法是 `GRPO`
+- rollout engine 是 `vllm` 或你传入的 `$ENGINE`
+- `rollout.n=2`，即每条 prompt 采样两个 response
+
+**1. main_ppo 初始化**
+
+入口函数是 [main_ppo.py::main](<E:\学习历程\RL_project\verl\verl\trainer\main_ppo.py:33>)。
+
+流程：
+
+1. Hydra 组装完整 config。
+2. `auto_set_device(config)` 自动设置设备。
+3. `migrate_legacy_reward_impl(config)` 迁移旧 reward 配置到新结构。
+4. 调用 `run_ppo(config)`。
+
+`run_ppo()` 在 [main_ppo.py](<E:\学习历程\RL_project\verl\verl\trainer\main_ppo.py:52>)：
+
+1. 如果 Ray 没初始化，调用 `ray.init(...)`。
+2. 把 `TaskRunner` 包成 Ray remote actor。
+3. 创建 remote `TaskRunner`。
+4. 执行：
+
+```python
+ray.get(runner.run.remote(config))
+```
+
+所以真正训练逻辑是在 Ray actor `TaskRunner.run()` 里执行的。
+
+**2. TaskRunner.run：构建训练系统**
+
+位置是 [main_ppo.py::TaskRunner.run](<E:\学习历程\RL_project\verl\verl\trainer\main_ppo.py:286>)。
+
+它先打印并 resolve config，然后开始搭建角色：
+
+1. `add_actor_rollout_worker(config)`
+   - demo 默认 `trainer.use_legacy_worker_impl=disable`
+   - 所以使用新 worker：[engine_workers.py::ActorRolloutRefWorker](<E:\学习历程\RL_project\verl\verl\workers\engine_workers.py:436>)
+   - actor 和 rollout 逻辑在同一类 worker 体系里管理
+
+2. `add_critic_worker(config)`
+   - 会注册 critic worker 类型
+   - 但 GRPO 默认不需要 critic，后面 `RayPPOTrainer` 会通过 `need_critic(config)` 决定是否真的初始化 critic
+
+3. `add_reward_model_resource_pool(config)`
+   - alpamayo demo 没启用 reward model，`reward.reward_model.enable=False`
+   - 所以没有单独 reward model GPU pool
+
+4. `add_ref_policy_worker(config, actor_rollout_cls)`
+   - 你脚本里设置了 `actor_rollout_ref.actor.use_kl_loss=True`
+   - 所以需要 reference policy，用于 actor KL loss
+
+然后：
+
+5. `validate_config(...)`
+6. `copy_to_local(config.actor_rollout_ref.model.path)`
+   - 把模型路径规范成本地路径
+7. 加载 tokenizer 和 processor：
+
+```python
+tokenizer = hf_tokenizer(local_path, ...)
+processor = hf_processor(local_path, ...)
+```
+
+对 Alpamayo/Qwen-VL 来说，`processor` 很关键，后面处理图片和 chat template 都靠它。
+
+**3. 创建 dataset 和 sampler**
+
+仍在 `TaskRunner.run()`。
+
+训练集创建：
+
+```python
+train_dataset = create_rl_dataset(
+    config.data.train_files,
+    config.data,
+    tokenizer,
+    processor,
+    is_train=True,
+)
+```
+
+对应 [main_ppo.py::create_rl_dataset](<E:\学习历程\RL_project\verl\verl\trainer\main_ppo.py:397>)。
+
+内部调用：
+
+```python
+dataset_cls = get_dataset_class(data_config)
+```
+
+对应 [rl_dataset.py::get_dataset_class](<E:\学习历程\RL_project\verl\verl\utils\dataset\rl_dataset.py:424>)。
+
+因为 config 里有：
+
+```yaml
+data.custom_cls.path = examples/alpamayo_demo/dataset.py
+data.custom_cls.name = AlpamayoDemoDataset
+```
+
+所以不会用默认 `RLHFDataset`，而是动态加载：
+
+```python
+AlpamayoDemoDataset
+```
+
+实例化位置：
+
+```python
+dataset = dataset_cls(
+    data_files=data_paths,
+    tokenizer=tokenizer,
+    processor=processor,
+    config=data_config,
+    max_samples=max_samples,
+)
+```
+
+在 [AlpamayoDemoDataset.__init__](<E:\学习历程\RL_project\verl\examples\alpamayo_demo\dataset.py:117>) 里：
+
+1. 保存 `data_files`
+2. 保存 tokenizer/config
+3. 读取 `clip_id_key`、`t0_us`、`num_frames`、`camera_features`
+4. 调用 `_read_files()`
+5. `_read_files()` 逐行读 `train.jsonl`
+6. 每行 `json.loads(line)` 后放进 `self.dataframe`
+
+此时只是把 JSONL 加载成 Python dict 列表，还没有读取图片，也没有 tokenizer。
+
+sampler 创建在 [main_ppo.py::create_rl_sampler](<E:\学习历程\RL_project\verl\verl\trainer\main_ppo.py:422>)：
+
+- 如果 `data.shuffle=True`，用 `RandomSampler`
+- 否则用 `SequentialSampler`
+
+默认配置里 `shuffle=True`。
+
+**4. 创建 RayPPOTrainer**
+
+`TaskRunner.run()` 接着创建 [RayPPOTrainer](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:234>)：
+
+```python
+trainer = RayPPOTrainer(
+    config=config,
+    tokenizer=tokenizer,
+    processor=processor,
+    role_worker_mapping=...,
+    resource_pool_manager=...,
+    train_dataset=train_dataset,
+    val_dataset=val_dataset,
+    collate_fn=collate_fn,
+    train_sampler=train_sampler,
+)
+```
+
+`RayPPOTrainer.__init__()` 里会判断：
+
+- `self.use_reference_policy = need_reference_policy(config)`
+- `self.use_rm = need_reward_model(config)`
+- `self.use_critic = need_critic(config)`
+
+对 alpamayo demo：
+
+- `use_reference_policy=True`，因为 `actor.use_kl_loss=True`
+- `use_rm=False`，因为没有启用 reward model
+- `use_critic` 通常是 `False`，因为 `adv_estimator=grpo`
+
+然后调用 `_create_dataloader(...)`。
+
+**5. 创建 DataLoader**
+
+位置是 [ray_trainer.py::_create_dataloader](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:322>)。
+
+训练 DataLoader 是：
+
+```python
+StatefulDataLoader(
+    dataset=self.train_dataset,
+    batch_size=data.train_batch_size,
+    drop_last=True,
+    collate_fn=collate_fn,
+    sampler=train_sampler,
+)
+```
+
+demo 里 `data.train_batch_size=4`。
+
+当 DataLoader 取样时，才真正调用：
+
+```python
+AlpamayoDemoDataset.__getitem__(item)
+```
+
+在 [dataset.py::__getitem__](<E:\学习历程\RL_project\verl\examples\alpamayo_demo\dataset.py:219>)：
+
+1. 取一条 JSON dict
+2. 调 `_build_messages_from_clip(row_dict)`
+3. 通过 `clip_id` 加载 NCore/physical_ai_av 数据
+4. 读取图像帧和 ego history trajectory
+5. 把图像转成 PIL Image
+6. 用 `DeltaTrajectoryTokenizer` 把历史轨迹变成离散 `<i...>` token
+7. 构造 Qwen-VL `raw_prompt`
+8. 返回带 `raw_prompt`、`reward_model`、`extra_info` 的样本 dict
+
+DataLoader 的 `collate_fn` 在 [rl_dataset.py::collate_fn](<E:\学习历程\RL_project\verl\verl\utils\dataset\rl_dataset.py:31>)：
+
+- tensor 字段 stack
+- 非 tensor 字段变成 `np.ndarray(dtype=object)`
+
+**6. 初始化 Ray workers**
+
+创建 trainer 后，`TaskRunner.run()` 调：
+
+```python
+trainer.init_workers()
+```
+
+位置是 [ray_trainer.py::init_workers](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:688>)。
+
+这里做几件大事：
+
+1. 创建 Ray resource pool。
+2. 创建 actor/rollout worker group。
+3. 如需要，创建 ref worker group。
+4. 调用：
+
+```python
+self.actor_rollout_wg.init_model()
+```
+
+这会在 Ray workers 上初始化模型、优化器、rollout engine。新 worker 路径下会进入 [ActorRolloutRefWorker](<E:\学习历程\RL_project\verl\verl\workers\engine_workers.py:436>)，内部构造：
+
+- actor training worker
+- ref worker
+- rollout engine
+
+5. 创建 RewardLoopManager：
+
+```python
+self.reward_loop_manager = RewardLoopManager(...)
+```
+
+即使没有 reward model，也会创建 reward loop workers，用来自定义 Python reward 函数打分。
+
+6. 创建 AgentLoopManager：
+
+```python
+self.async_rollout_manager = AgentLoopManager.create(...)
+```
+
+它管理 rollout replicas 和 agent loop workers。
+
+7. 创建 CheckpointEngineManager：
+
+```python
+self.checkpoint_manager = CheckpointEngineManager(...)
+```
+
+它负责 actor 权重和 rollout engine 之间的同步、sleep/wake、checkpoint 等。
+
+**7. 进入 fit：训练前准备**
+
+位置是 [ray_trainer.py::fit](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1281>)。
+
+开始时：
+
+1. 创建 logger。
+2. `self.global_steps = 0`
+3. `_load_checkpoint()`
+4. `self.checkpoint_manager.update_weights(self.global_steps)`
+
+这一步很重要：actor 初始化后，要把当前 actor 权重同步给 rollout engine。否则 rollout server 生成用的不是当前训练权重。
+
+然后如果：
+
+```yaml
+trainer.val_before_train=True
+```
+
+会先跑一次 validation。demo 默认配置是 True，脚本没覆盖，所以会先验证。
+
+**8. 一个训练 step 的主流程**
+
+训练循环：
+
+```python
+for epoch in ...:
+    for batch_dict in self.train_dataloader:
+```
+
+第一步：
+
+```python
+batch = DataProto.from_single_dict(batch_dict)
+```
+
+位置 [protocol.py::DataProto.from_single_dict](<E:\学习历程\RL_project\verl\verl\protocol.py:480>)。
+
+结果是：
+
+```text
+batch.batch:
+  dummy_tensor
+
+batch.non_tensor_batch:
+  raw_prompt
+  data_source
+  reward_model
+  extra_info
+  index
+  tools_kwargs
+  interaction_kwargs
+```
+
+然后加：
+
+```python
+batch.non_tensor_batch["uid"] = uuid
+```
+
+GRPO 后面靠 `uid` 把同一个 prompt 的多个 response 分组。
+
+**9. 构造 rollout batch**
+
+```python
+gen_batch = self._get_gen_batch(batch)
+```
+
+位置 [ray_trainer.py::_get_gen_batch](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:488>)。
+
+它保留 rollout 需要的非 tensor 字段，尤其是：
+
+- `raw_prompt`
+- `data_source`
+- `reward_model`
+- `extra_info`
+- `uid`
+
+然后：
+
+```python
+gen_batch_output = gen_batch.repeat(
+    repeat_times=actor_rollout_ref.rollout.n,
+    interleave=True,
+)
+```
+
+demo 里 `n=2`。所以 batch size 4 会变成 8 条 rollout 请求。
+
+**10. AgentLoopManager 执行 rollout**
+
+调用：
+
+```python
+gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+```
+
+位置 [ray_trainer.py](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1372>)。
+
+进入 [AgentLoopManager.generate_sequences](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:1281>)：
+
+1. 把 `DataProto` 切成多个 chunk。
+2. 分发给多个 `AgentLoopWorker`。
+3. 等所有 worker 返回。
+4. concat 成一个 `DataProto`。
+
+`AgentLoopWorker.generate_sequences()` 对每条样本创建 task，进入 `_run_agent_loop()`。
+
+默认 agent 是 `single_turn_agent`，所以调用：
+
+- [SingleTurnAgentLoop.run](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\single_turn_agent_loop.py:44>)
+
+对 alpamayo 每条样本，它做：
+
+1. 取 `raw_prompt`
+2. `process_vision_info()` 提取 PIL images
+3. `apply_chat_template()` 得到 prompt text/token ids
+4. 调：
+
+```python
+server_manager.generate(
+    prompt_ids=prompt_ids,
+    image_data=images,
+    video_data=videos,
+)
+```
+
+`server_manager.generate()` 就是真正请求 rollout 模型生成的接口。demo 用 vLLM 时，它最终会把 prompt ids 和 image data 发给 vLLM server，拿回 response token ids。
+
+**11. rollout 后处理**
+
+每条样本生成完后进入：
+
+- [AgentLoopWorker._agent_loop_postprocess](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:677>)
+
+这里会：
+
+1. prompt 左 padding 到 `max_prompt_length`
+2. response 右 padding 到 `max_response_length`
+3. 拼：
+
+```python
+input_ids = prompt_ids + response_ids
+attention_mask = prompt_mask + response_mask
+```
+
+4. 重新从 `raw_prompt` 生成 `multi_modal_inputs`
+5. 基于完整 `input_ids` 和视觉 grid 计算 `position_ids`
+6. 调 reward loop 得到当前 rollout 的 score
+7. 返回 `_InternalAgentLoopOutput`
+
+多个输出再被 `_postprocess()` 合并成 DataProto，包含：
+
+```text
+batch:
+  prompts
+  responses
+  response_mask
+  input_ids
+  attention_mask
+  position_ids
+  rm_scores
+
+non_tensor_batch:
+  raw_prompt
+  data_source
+  reward_model
+  extra_info
+  uid
+  multi_modal_inputs
+  __num_turns__
+```
+
+**12. 回到 trainer：合并原 batch 和 rollout output**
+
+在 [ray_trainer.py::fit](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1408>)：
+
+```python
+batch = batch.repeat(repeat_times=n, interleave=True)
+batch = batch.union(gen_batch_output)
+```
+
+现在 batch 从“原始 prompt batch”变成“训练 batch”。每条原始样本有 2 条 response。
+
+**13. 计算训练信号**
+
+后续 trainer 做：
+
+1. `response_mask`
+2. `extract_reward(batch)`
+3. `batch.batch["token_level_scores"] = reward_tensor`
+4. `token_level_rewards = token_level_scores`
+5. `_compute_old_log_prob(batch)`
+6. `_compute_ref_log_prob(batch)`，因为 `use_kl_loss=True`
+7. `compute_advantage(...)`
+
+GRPO 分支在 [ray_trainer.py::compute_advantage](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:113>)。
+
+它用：
+
+```python
+index=batch.non_tensor_batch["uid"]
+```
+
+把同一个原始样本的两个 rollout response 分到同一组，计算相对 advantage。
+
+**14. actor 更新**
+
+最后进入：
+
+```python
+actor_output = self._update_actor(batch)
+```
+
+新 worker 路径会到：
+
+- [engine_workers.py::TrainingWorker.update_actor](<E:\学习历程\RL_project\verl\verl\workers\engine_workers.py:645>)
+- 内部再调用 actor 的训练逻辑
+
+在 DP actor 路径中核心是：
+
+- [dp_actor.py::update_policy](<E:\学习历程\RL_project\verl\verl\workers\actor\dp_actor.py:513>)
+- [dp_actor.py::_forward_micro_batch](<E:\学习历程\RL_project\verl\verl\workers\actor\dp_actor.py:150>)
+
+它会取：
+
+```text
+responses
+response_mask
+input_ids
+attention_mask
+position_ids
+old_log_probs
+advantages
+ref_log_prob
+multi_modal_inputs
+```
+
+然后 forward 当前 actor，得到当前 log probs，计算 policy loss 和 KL loss，反向传播并 optimizer step。
+
+**15. 权重同步到 rollout**
+
+actor 更新后，trainer 会调用：
+
+```python
+self.checkpoint_manager.update_weights(self.global_steps)
+```
+
+位置 [ray_trainer.py](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1586>)。
+
+这一步把刚更新过的 actor 权重同步给 rollout engine。下一 step 的 `server_manager.generate()` 就会用新权重生成。
+
+**一句话总览**
+
+alpamayo demo 的 RL 训练不是 dataset 直接产出 `input_ids` 训练模型，而是：
+
+```text
+clip_id -> raw_prompt(images + trajectory tokens)
+-> AgentLoop 调 vLLM 生成 response
+-> postprocess 成 prompt/response/input_ids/multi_modal_inputs
+-> reward 打分
+-> GRPO 用同一 uid 的多条 response 算 advantage
+-> actor 用完整 input_ids + multi_modal_inputs 更新
+-> 更新后的 actor 权重同步给 rollout engine
+```
+
+这里 `AgentLoop` 负责“单条样本怎么生成”，`AgentLoopWorker` 负责“一个 Ray actor 处理多条样本”，`AgentLoopManager` 负责“trainer 侧把 batch 分发给多个 worker 并合并结果”。
+
+### alpamayo demo rl 架构
+![](./imgs/verl/verl_alpamayo流程.drawio.png)
+
+### alpamayo demo rl 流程
+#### 结构图
+```
+RayPPOTrainer
+  ├─ actor_rollout_wg
+  │    ├─ ActorRolloutRefWorker rank 0
+  │    │    ├─ actor TrainingWorker
+  │    │    ├─ ref TrainingWorker
+  │    │    └─ rollout: BaseRollout / vLLM rollout adapter
+  │    ├─ ActorRolloutRefWorker rank 1
+  │    │    └─ rollout: BaseRollout / vLLM rollout adapter
+  │    └─ ...
+  │
+  ├─ AgentLoopManager
+  │    ├─ rollout_replicas
+  │    │    └─ vLLMReplica rank 0
+  │    │         ├─ workers = [ActorRolloutRefWorker rank 0..N]
+  │    │         ├─ servers = [vLLMHttpServer ...]
+  │    │         └─ _server_address
+  │    │
+  │    └─ AgentLoopWorkers
+  │         └─ server_manager.generate(...) -> vLLMReplica._server_address
+  │
+  └─ CheckpointEngineManager
+       ├─ trainer = actor_rollout_wg
+       └─ replicas = AgentLoopManager.rollout_replicas
+  │
+  └─ RewardLoopManager
+        └─ RewardLoopWorkers
+            └─ compute_score(...) -> Python reward function
+```
+#### 单次训练 step
+`RayPPOTrainer`核心控制关系：
+
+```text
+RayPPOTrainer 是总控
+  ├─ 控制 train_dataloader
+  ├─ 控制 actor_rollout_wg，也就是一组 ActorRolloutRefWorker
+  ├─ 控制 AgentLoopManager
+  │    ├─ AgentLoopManager 管 rollout replicas / vLLM server
+  │    └─ AgentLoopManager 管多个 AgentLoopWorker
+  ├─ 控制 RewardLoopManager
+  │    └─ RewardLoopManager 管多个 RewardLoopWorker
+  └─ 控制 CheckpointEngineManager
+       └─ CheckpointEngineManager 管 rollout sleep/wake 和 actor -> rollout 权重同步
+```
+
+一个容易混淆的点：`AgentLoopWorker` 不是直接把请求发给 `actor_rollout_wg.compute_log_prob/update_actor` 这类训练接口。它通过 `server_manager.generate()` 请求 rollout server。这个 rollout server 是 `AgentLoopManager` 初始化的 rollout replica，在 hybrid 模式下和 `actor_rollout_wg` 共享同一批 GPU/worker 资源，并由 `CheckpointEngineManager` 同步 actor 权重。
+
+**单次训练 Step**
+
+1. **RayPPOTrainer 从 DataLoader 取 batch**
+
+位置：[ray_trainer.py::fit](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1338>)
+
+```python
+for batch_dict in self.train_dataloader:
+```
+
+这里 `self.train_dataloader` 是 `StatefulDataLoader`，由 `RayPPOTrainer._create_dataloader()` 创建。
+
+DataLoader 每取一条数据，会调用：
+
+```python
+AlpamayoDemoDataset.__getitem__(index)
+```
+
+在 alpamayo demo 中，`__getitem__` 做：
+
+```text
+jsonl record
+  -> clip_id
+  -> load_physical_aiavdataset(...)
+  -> 读取 image_frames / ego_history_xyz / ego_history_rot
+  -> 图像 tensor 转 PIL image
+  -> DeltaTrajectoryTokenizer 编码历史轨迹
+  -> create_message(...)
+  -> replace_history_placeholder(...)
+  -> 得到 raw_prompt
+```
+
+返回单条样本大致是：
+
+```python
+{
+  "raw_prompt": [...Qwen-VL messages with images...],
+  "data_source": "alpamayo_demo",
+  "reward_model": {"ground_truth": ...},
+  "extra_info": {...},
+  "index": ...,
+  "dummy_tensor": tensor([0]),
+}
+```
+
+2. **collate_fn 把多条样本合成 batch_dict**
+
+位置：[rl_dataset.py::collate_fn](<E:\学习历程\RL_project\verl\verl\utils\dataset\rl_dataset.py:31>)
+
+规则是：
+
+```text
+tensor 字段 -> torch.stack
+非 tensor 字段 -> np.ndarray(dtype=object)
+```
+
+所以此时：
+
+```text
+batch_dict["dummy_tensor"] 是 tensor
+batch_dict["raw_prompt"] 是 object array
+batch_dict["reward_model"] 是 object array
+batch_dict["extra_info"] 是 object array
+```
+
+3. **RayPPOTrainer 把 batch_dict 转成 DataProto**
+
+位置：[ray_trainer.py::fit](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1350>)
+
+```python
+batch = DataProto.from_single_dict(batch_dict)
+```
+
+结果：
+
+```text
+batch.batch:
+  dummy_tensor
+
+batch.non_tensor_batch:
+  raw_prompt
+  data_source
+  reward_model
+  extra_info
+  index
+  tools_kwargs
+  interaction_kwargs
+```
+
+然后 trainer 加 `uid`：
+
+```python
+batch.non_tensor_batch["uid"] = ...
+```
+
+`uid` 用于 GRPO 分组：同一个 prompt 的多个 rollout response 共享同一个 `uid`。
+
+4. **RayPPOTrainer 用 _get_gen_batch 构造 rollout 输入**
+
+位置：[ray_trainer.py::_get_gen_batch](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:488>)
+
+```python
+gen_batch = self._get_gen_batch(batch)
+```
+
+`gen_batch` 是给 rollout 用的 DataProto，里面保留：
+
+```text
+raw_prompt
+data_source
+reward_model
+extra_info
+uid
+index
+tools_kwargs
+interaction_kwargs
+```
+
+也就是说，rollout 阶段最重要的输入是 `raw_prompt`，还没有 `input_ids`、`responses`。
+
+5. **RayPPOTrainer 按 rollout.n 复制请求**
+
+alpamayo demo 里：
+
+```bash
+actor_rollout_ref.rollout.n=2
+```
+
+所以：
+
+```python
+gen_batch_output = gen_batch.repeat(repeat_times=2, interleave=True)
+```
+
+如果原 batch 有 4 条样本，现在 rollout 请求变成 8 条：
+
+```text
+sample0 response0
+sample0 response1
+sample1 response0
+sample1 response1
+...
+```
+
+同一个原始样本的两条请求共享同一个 `uid`。
+
+6. **RayPPOTrainer 把 rollout batch 交给 AgentLoopManager**
+
+位置：[ray_trainer.py::fit](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1372>)
+
+```python
+gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+```
+
+这里的 `self.async_rollout_manager` 是 `AgentLoopManager`。
+
+`AgentLoopManager` 由 [RayPPOTrainer.init_workers](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:862>) 创建：
+
+```python
+AgentLoopManager.create(
+    config=config,
+    worker_group=self.actor_rollout_wg,
+    rollout_resource_pool=actor_rollout_resource_pool,
+    reward_loop_worker_handles=...
+)
+```
+
+注意：`worker_group=self.actor_rollout_wg` 表示 rollout server 是 hybrid 模式，和 actor/ref training worker group 共用资源。
+
+7. **AgentLoopManager 管理 rollout replicas 和 AgentLoopWorkers**
+
+创建时，`AgentLoopManager` 做两件事：
+
+第一，初始化 rollout replicas：
+
+位置：[agent_loop.py::_initialize_llm_servers](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:1184>)
+
+```python
+self.rollout_replicas = [...]
+server.init_hybrid(self.worker_group)
+self.server_handles = [...]
+self.server_addresses = [...]
+```
+
+这里会根据 `actor_rollout_ref.rollout.name` 创建 vLLM/SGLang/HF 等后端的 rollout server。alpamayo demo 一般是 vLLM。
+
+第二，初始化多个 `AgentLoopWorker`：
+
+位置：[agent_loop.py::_init_agent_loop_workers](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:1231>)
+
+每个 `AgentLoopWorker` 初始化时会拿到：
+
+```text
+config
+servers = list(zip(server_addresses, server_handles))
+load_balancer_handle
+reward_loop_worker_handles
+```
+
+所以 `AgentLoopWorker` 知道有哪些 rollout server 可以请求。
+
+8. **AgentLoopManager 把 rollout batch 切给多个 AgentLoopWorker**
+
+位置：[agent_loop.py::AgentLoopManager.generate_sequences](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:1281>)
+
+```python
+chunks = prompts.chunk(len(self.agent_loop_workers))
+outputs = await asyncio.gather(
+    worker.generate_sequences.remote(chunk)
+    for worker, chunk in zip(...)
+)
+output = DataProto.concat(outputs)
+```
+
+所以：
+
+```text
+AgentLoopManager
+  -> 把 DataProto 切 chunk
+  -> 分发给多个 AgentLoopWorker
+  -> 等待所有 worker 返回
+  -> concat 成完整 rollout output
+```
+
+9. **AgentLoopWorker 逐条处理样本，并创建 SingleTurnAgentLoop**
+
+位置：[agent_loop.py::AgentLoopWorker.generate_sequences](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:561>)
+
+对 chunk 中每条样本：
+
+```python
+kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+self._run_agent_loop(..., **kwargs)
+```
+
+如果样本没有显式指定 `agent_name`，默认使用：
+
+```text
+single_turn_agent
+```
+
+于是 `_run_agent_loop()` 会实例化：
+
+```text
+SingleTurnAgentLoop
+```
+
+也就是说：
+
+```text
+AgentLoopWorker 管一个 chunk
+SingleTurnAgentLoop 处理 chunk 中的一条样本
+```
+
+10. **SingleTurnAgentLoop 把 alpamayo raw_prompt 变成 vLLM 请求**
+
+位置：[single_turn_agent_loop.py::SingleTurnAgentLoop.run](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\single_turn_agent_loop.py:44>)
+
+对单条 alpamayo 样本：
+
+```python
+messages = list(kwargs["raw_prompt"])
+```
+
+然后：
+
+```python
+multi_modal_data = await self.process_vision_info(messages)
+```
+
+这一步会调用 alpamayo dataset 的：
+
+```python
+AlpamayoDemoDataset.process_vision_info(...)
+```
+
+提取 images/videos。
+
+然后：
+
+```python
+prompt_ids = await self.apply_chat_template(
+    messages,
+    images=images,
+    videos=videos,
+)
+```
+
+这里 processor 会把 Qwen-VL messages 转成模型可用的 prompt token ids。
+
+此时构造出的 vLLM 请求核心数据是：
+
+```text
+request_id
+prompt_ids
+sampling_params
+image_data
+video_data
+```
+
+11. **server_manager.generate 请求 rollout backend 生成**
+
+还是在 `SingleTurnAgentLoop.run()`：
+
+```python
+output = await self.server_manager.generate(
+    request_id=uuid4().hex,
+    prompt_ids=prompt_ids,
+    sampling_params=sampling_params,
+    image_data=images,
+    video_data=videos,
+)
+```
+
+这里的 `server_manager` 属于 `AgentLoopWorker`，它内部持有 `AgentLoopManager` 传进来的 rollout server addresses/handles。
+
+数据流是：
+
+```text
+SingleTurnAgentLoop
+  -> server_manager.generate(...)
+  -> AsyncLLMServerManager
+  -> load balancer 选择 rollout replica
+  -> rollout server / vLLM
+  -> 返回 response token ids / logprobs
+```
+
+这一步生成不是走 `actor_rollout_wg.compute_log_prob()`，而是走 rollout server 的 generation 接口。
+
+但 rollout server 在 hybrid 模式下是通过：
+
+```python
+server.init_hybrid(self.actor_rollout_wg)
+```
+
+和 `ActorRolloutRefWorker` 所在 worker group 绑定的，所以它用的是同一组 GPU 资源，并且权重来自 actor。
+
+12. **SingleTurnAgentLoop 返回 AgentLoopOutput**
+
+生成结束后返回：
+
+```python
+AgentLoopOutput(
+    prompt_ids=prompt_ids,
+    response_ids=output.token_ids,
+    response_mask=...,
+    multi_modal_data=...,
+    num_turns=2,
+)
+```
+
+此时还是单条样本级别的结果。
+
+13. **AgentLoopWorker 后处理单条 rollout 输出**
+
+位置：[agent_loop.py::_agent_loop_postprocess](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:677>)
+
+它把单条输出整理成训练需要的格式：
+
+```text
+prompt_ids 左 padding 到 max_prompt_length
+response_ids 右 padding 到 max_response_length
+input_ids = padded_prompt_ids + padded_response_ids
+attention_mask = prompt_attention_mask + response_attention_mask
+response_mask = 标记哪些 response token 是模型生成的
+```
+
+然后重建多模态输入：
+
+```python
+multi_modal_inputs = self._compute_multi_modal_inputs(
+    output,
+    input_ids,
+    raw_prompt,
+    output.prompt_ids,
+)
+```
+
+这里从 `raw_prompt` 重新 processor 出：
+
+```text
+pixel_values
+image_grid_thw
+video_grid_thw
+images_seqlens
+```
+
+并 pop 掉 processor 自己生成的 `input_ids/attention_mask`，因为训练用的主序列已经是：
+
+```text
+padded prompt + response
+```
+
+接着计算：
+
+```python
+position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
+```
+
+14. **AgentLoopWorker 调 RewardLoopWorker 计算 reward**
+
+如果 reward loop workers 可用，`AgentLoopWorker` 会在 postprocess 中调用：
+
+```python
+selected_reward_loop_worker.compute_score.remote(data)
+```
+
+控制关系是：
+
+```text
+RewardLoopManager
+  -> 管多个 RewardLoopWorker
+
+AgentLoopWorker
+  -> 持有 RewardLoopManager 提供的 reward_loop_worker_handles
+  -> 单条样本 postprocess 时选一个 RewardLoopWorker 打分
+```
+
+alpamayo demo 的 reward worker 会：
+
+```text
+decode response ids
+-> 调 examples/alpamayo_demo/reward_fn.py::compute_score
+-> 得到 reward_score
+```
+
+然后 reward 写入 rollout output 的 `rm_scores`。
+
+15. **AgentLoopWorker 把多条样本拼成 rollout DataProto**
+
+位置：[agent_loop.py::_postprocess](<E:\学习历程\RL_project\verl\verl\experimental\agent_loop\agent_loop.py:1006>)
+
+一个 `AgentLoopWorker` 会把自己 chunk 内所有单条输出拼成：
+
+```text
+rollout DataProto
+  batch:
+    prompts
+    responses
+    response_mask
+    input_ids
+    attention_mask
+    position_ids
+    rm_scores
+    maybe rollout_log_probs
+
+  non_tensor_batch:
+    raw_prompt
+    data_source
+    reward_model
+    extra_info
+    uid
+    multi_modal_inputs
+    __num_turns__
+```
+
+然后返回给 `AgentLoopManager`。
+
+16. **AgentLoopManager 合并所有 AgentLoopWorker 输出**
+
+`AgentLoopManager.generate_sequences()` 收到多个 worker 输出后：
+
+```python
+output = DataProto.concat(outputs)
+```
+
+然后返回给 `RayPPOTrainer`。
+
+17. **RayPPOTrainer 让 rollout replicas sleep**
+
+生成结束后，trainer 立刻调用：
+
+```python
+self.checkpoint_manager.sleep_replicas()
+```
+
+位置：[ray_trainer.py](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1373>)
+
+控制关系：
+
+```text
+RayPPOTrainer
+  -> CheckpointEngineManager
+      -> rollout replicas sleep
+```
+
+`sleep_replicas()` 的语义是让 rollout server 释放/降低显存占用，给后面的 actor/ref 训练计算让资源。
+
+18. **RayPPOTrainer 合并原始 batch 和 rollout output**
+
+位置：[ray_trainer.py](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1408>)
+
+```python
+batch = batch.repeat(repeat_times=rollout.n, interleave=True)
+batch = batch.union(gen_batch_output)
+```
+
+现在 `batch` 才变成完整训练 batch：
+
+```text
+原始样本字段
++ rollout 生成字段
++ reward 字段
++ multi_modal_inputs
+```
+
+19. **RayPPOTrainer 提取 reward 并计算训练信号**
+
+```python
+reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+batch.batch["token_level_scores"] = reward_tensor
+batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+```
+
+因为 alpamayo demo 设置：
+
+```bash
+algorithm.use_kl_in_reward=False
+```
+
+所以 reward 不会在这里扣 KL penalty。
+
+20. **RayPPOTrainer 通过 actor_rollout_wg 计算 old_log_probs**
+
+位置：[ray_trainer.py::_compute_old_log_prob](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1194>)
+
+控制关系：
+
+```text
+RayPPOTrainer
+  -> actor_rollout_wg.compute_log_prob(batch)
+      -> 多个 ActorRolloutRefWorker
+          -> actor TrainingWorker
+              -> actor model forward
+```
+
+这里用的是完整训练序列：
+
+```text
+input_ids = prompt + response
+attention_mask
+position_ids
+multi_modal_inputs
+```
+
+得到：
+
+```text
+old_log_probs
+entropys
+```
+
+21. **RayPPOTrainer 通过 ref worker 计算 ref_log_prob**
+
+因为 alpamayo demo 里：
+
+```bash
+actor_rollout_ref.actor.use_kl_loss=True
+```
+
+所以需要 reference policy。
+
+控制关系：
+
+```text
+RayPPOTrainer
+  -> ref_policy_wg.compute_ref_log_prob(batch)
+      -> ActorRolloutRefWorker
+          -> ref TrainingWorker
+              -> ref model forward
+```
+
+在当前新 worker colocated 路径里，actor/ref 通常都在 `ActorRolloutRefWorker` 体系里，只是调用不同内部对象。
+
+22. **RayPPOTrainer 在 driver 上计算 GRPO advantage**
+
+位置：[ray_trainer.py::compute_advantage](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:113>)
+
+alpamayo demo 是：
+
+```bash
+algorithm.adv_estimator=grpo
+rollout.n=2
+```
+
+所以它用：
+
+```python
+index=batch.non_tensor_batch["uid"]
+```
+
+把同一个 prompt 的 2 条 response 分为一组，基于组内 reward 计算 advantage。
+
+这一步不在 worker 上做，而是在 `RayPPOTrainer` driver 进程里做。
+
+23. **RayPPOTrainer 通过 actor_rollout_wg 更新 actor**
+
+位置：[ray_trainer.py::_update_actor](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1229>)
+
+控制关系：
+
+```text
+RayPPOTrainer
+  -> actor_rollout_wg.update_actor(batch)
+      -> 多个 ActorRolloutRefWorker
+          -> actor TrainingWorker
+              -> split mini-batch
+              -> split micro-batch
+              -> model forward
+              -> PPO/GRPO policy loss
+              -> KL loss against ref_log_prob
+              -> backward
+              -> optimizer step
+```
+
+actor update 消费的核心字段是：
+
+```text
+responses
+response_mask
+input_ids
+attention_mask
+position_ids
+old_log_probs
+advantages
+ref_log_prob
+multi_modal_inputs
+```
+
+24. **RayPPOTrainer 同步新 actor 权重给 rollout replicas**
+
+actor 更新完成后：
+
+```python
+self.checkpoint_manager.update_weights(self.global_steps)
+```
+
+位置：[ray_trainer.py](<E:\学习历程\RL_project\verl\verl\trainer\ppo\ray_trainer.py:1586>)
+
+控制关系：
+
+```text
+RayPPOTrainer
+  -> CheckpointEngineManager
+      -> trainer = actor_rollout_wg
+      -> replicas = AgentLoopManager.rollout_replicas
+      -> 把 actor 新权重同步给 rollout replicas
+      -> wake up rollout replicas
+```
+
+所以下一次训练 step 里的：
+
+```python
+server_manager.generate(...)
+```
+
+就会使用更新后的 actor 权重。
+
+**单次训练主线压缩图**
+
+```text
+RayPPOTrainer.fit
+  1. train_dataloader 取 batch_dict
+       -> AlpamayoDemoDataset.__getitem__
+       -> raw_prompt
+
+  2. DataProto.from_single_dict(batch_dict)
+       -> batch
+
+  3. _get_gen_batch(batch)
+       -> gen_batch
+
+  4. gen_batch.repeat(rollout.n)
+       -> rollout requests
+
+  5. AgentLoopManager.generate_sequences(gen_batch)
+       AgentLoopManager 管：
+         - rollout replicas / vLLM servers
+         - AgentLoopWorkers
+         - load balancer
+
+  6. AgentLoopManager 切 chunk 给 AgentLoopWorker
+
+  7. AgentLoopWorker 对每条样本创建 SingleTurnAgentLoop
+
+  8. SingleTurnAgentLoop:
+       raw_prompt
+       -> process_vision_info
+       -> apply_chat_template
+       -> prompt_ids/images/videos
+       -> server_manager.generate
+       -> rollout response
+
+  9. server_manager.generate:
+       -> 选择 rollout replica
+       -> vLLM server 生成
+       -> 返回 response ids
+
+  10. AgentLoopWorker postprocess:
+       prompt/response padding
+       input_ids = prompt + response
+       rebuild multi_modal_inputs
+       compute position_ids
+       RewardLoopWorker compute_score
+       -> rollout DataProto
+
+  11. AgentLoopManager concat 所有 worker 输出
+       -> gen_batch_output
+
+  12. RayPPOTrainer:
+       checkpoint_manager.sleep_replicas()
+       batch.repeat(n)
+       batch.union(gen_batch_output)
+
+  13. RayPPOTrainer:
+       extract reward
+       actor_rollout_wg.compute_log_prob
+       ref_policy_wg.compute_ref_log_prob
+       compute_grpo_advantage
+
+  14. RayPPOTrainer:
+       actor_rollout_wg.update_actor
+
+  15. RayPPOTrainer:
+       checkpoint_manager.update_weights
+       -> actor 新权重同步到 rollout replicas
+```
+
+最重要的控制边界是：
+
+```text
+RayPPOTrainer 控训练主循环
+AgentLoopManager 控 rollout 请求分发和 rollout replicas
+AgentLoopWorker 控 batch chunk 中每条样本的 AgentLoop 执行
+SingleTurnAgentLoop 控单条样本如何构造 generate 请求
+RewardLoopManager 控 reward workers
+actor_rollout_wg 控 actor/ref 训练计算
+CheckpointEngineManager 控 actor 权重同步到 rollout
+```
