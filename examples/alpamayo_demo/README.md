@@ -8,6 +8,8 @@ The demo package provides:
 - `dataset.py`: a custom dataset that loads raw Alpamayo-style `clip_id` samples and converts them into verl-compatible multimodal prompts.
 - `reward_fn.py`: a custom reward function that checks whether decoded output still contains `<|cot_start|>` and `<|cot_end|>`.
 - `run_qwen3_vl_alpamayo_demo.sh`: a minimal GRPO run script that uses the custom dataset and custom reward hooks.
+- `reasoning_vla_vllm_wrapper.py`: a Cosmos-free vLLM wrapper for smoke-testing official Alpamayo ReasoningVLA training checkpoints.
+- `run_reasoning_vla_vllm_smoke.py`: a standalone vLLM load/generate check for the official ReasoningVLA checkpoint path.
 - `data/train.jsonl` and `data/val.jsonl`: tiny example files for a smoke-test style run.
 
 ## Quick start
@@ -29,6 +31,27 @@ The run script currently uses these paths by default:
 - `VAL_FILE=/workspace/ncore_10clips/val.jsonl`
 
 Edit the script or pass Hydra overrides at the end of the command if your model or data are stored elsewhere.
+
+## Official ReasoningVLA vLLM smoke test
+
+The main demo above uses a standalone exported Qwen3-VL/VLM checkpoint. To first verify that an official Alpamayo
+training-ready `ReasoningVLA` checkpoint can be loaded by vLLM inside this repo, run:
+
+```bash
+PYTHONPATH="$PWD:$PWD/alpamayo/src:$PWD/alpamayo/finetune:$PWD/alpamayo/finetune/rl/models" \
+python examples/alpamayo_demo/run_reasoning_vla_vllm_smoke.py \
+  --model "$ALPAMAYO_MODEL_DIR" \
+  --tensor-parallel-size 1 \
+  --max-model-len 2048 \
+  --max-tokens 64
+```
+
+`$ALPAMAYO_MODEL_DIR` should point to the output of Alpamayo's
+`scripts/convert_release_config_to_training.py`, not the thinner `Alpamayo-R1-10B-vlm` asset produced by
+`prepare_demo_asset.py`.
+
+This smoke test only validates vLLM registration, checkpoint weight loading, and generation. It does not yet adapt
+verl's actor-side model class or actor-to-rollout weight synchronization for full GRPO training.
 
 ## Dataset contract
 

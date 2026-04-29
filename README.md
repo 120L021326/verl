@@ -1,6 +1,6 @@
 ﻿# verl 代码学习笔记
 ### 数据划分配置
-按 `examples/alpamayo_demo/run_qwen3_vl_2b_demo.sh` 里的关键配置：
+按 `examples/alpamayo_demo/run_qwen3_vl_alpamayo_demo.sh` 里的关键配置：
 
 ```text
 data.train_batch_size = 2
@@ -282,15 +282,20 @@ rollout.generate_sequences(batch)
 
 ### 异步和同步比较
 ![](./imgs/verl/sync_vs_async.png)
+![](./imgs/verl/fully_async_policy_mode.svg)
 
 ### verl 相关常见指令
 ```
 export TORCH_CUDA_ARCH_LIST="8.6"
 export VERL_DEBUG_QWEN3_VL=1
+export ALPAMAYO_MODEL_DIR="/workspace/.cache/modelscope/hub/models/nv-community/Alpamayo-R1-10B/"
+export PYTHONPATH="$PWD/alpamayo/src:$PWD/alpamayo/finetune:$PWD/alpamayo/finetune/rl/models"
+export PYTHONPATH="$PWD:$PWD/alpamayo/src"
 ```
 ### verl 中有关 3D jagged 的问题（positon ids）
 jagged tensor 是一种特殊的 nested tensor，形状可以是 `(bs,seq)`，但每个 batch 里的 `seq` 长度不一样，其中值的存储方式是一个扁平的 `(total_nnz,)` tensor + 一个 offsets 来记录每条序列的起止位置。
 verl 里用它来存 `position_ids`，然而因为 mRoPE 的 `position_ids` 是 `(bs,4,seq)` 这种 3D case，jagged tensor 对 3D 的支持似乎存在问题，主要表现为值的存储逻辑混乱。
+
 **定位性修改**
 这些改动主要是为了确认 `position_ids` 到底在哪一层坏掉。
 
@@ -840,7 +845,7 @@ RayPPOTrainer
         └─ RewardLoopWorkers
             └─ compute_score(...) -> Python reward function
 ```
-#### 单次训练 step
+#### 单次训练 step 流程
 `RayPPOTrainer`核心控制关系：
 
 ```text
@@ -1597,3 +1602,363 @@ RewardLoopManager 控 reward workers
 actor_rollout_wg 控 actor/ref 训练计算
 CheckpointEngineManager 控 actor 权重同步到 rollout
 ```
+### alpamayo vllm 适配
+vllm 相关适配文件在 examples\alpamayo_demo 目录下：
+```
+run_reasoning_vla_vllm_smoke.py # vLLM 适配的单步推理脚本，主要验证 vLLM rollout adapter 的正确性
+register_reasoning_vla_vllm.py # 注册 vla 模型到 vllm 中
+reasoning_vla_vllm_wrapper.py # 构造可以用于 vllm 的 vla 模型 wrapper，这个 wrapper 被上一个文件注册进 vllm 中
+reasoning_vla_vllm_weight_mapper.py # 定义权重映射规则，把原始 vla checkpoint 映射成 vllm wrapper 可用的格式
+```
+主要参考的是 alpamayo 中 alpamayo\finetune\rl\models\reasoning_vla 目录下：
+```
+vllm_wrapper.py # 构造可以用于 vllm 的 vla 模型 wrapper
+weight_mapper.py # 定义权重映射规则，把原始 vla checkpoint 映射成 vllm wrapper 可用的格式
+```
+由于使用的 verl docker 镜像中的 vllm 版本可能和 alpamayo 中使用的版本不完全一致，所以在适配过程中根据实际 vllm 版本调整了 wrapper 的实现细节。
+#### Wrapper代码介绍
+`reasoning_vla_vllm_wrapper.py`这个文件主要构造可以用于 vllm 的 vla 模型 wrapper，实现 vllm 需要的接口，值得注意的是，vla 模型是 vlm + diffusion 的结构，但在该实现中，vllm 只会调用到 vlm 部分，所以在`__init__`方法中，会把 vla 模型 config 中关于 vlm 的 config 抽取出来，最终构造一个 vllm 中 Qwen3VL 架构的模型实例：
+```python
+self.vlm = init_vllm_registered_model(
+          vllm_config=vllm_config,
+          prefix=maybe_prefix(prefix, "vlm"),
+          architectures=["Qwen3VLForConditionalGeneration"],
+      )
+```
+值得注意的是，这里的`Qwen3VLForConditionalGeneration`架构是 vllm 中针对 Qwen3-VL 模型定义的一个高性能生成模型架构，这与 huggingface 上的 Qwen3-VL 是有差异的，所以在适配过程中需要把原始 vla 模型的权重通过 `reasoning_vla_vllm_weight_mapper.py` 里定义的映射规则转换成 vllm wrapper 可用的格式，才能正确加载到这个 vlm 模型实例里。
+之后一些接口的实现，比如 `get_input_embeddings`，也都是基于这个 vlm 模型实例来实现的，例如：
+```python
+def get_input_embeddings(
+      self, input_ids: torch.Tensor, multimodal_embeddings=None
+  ) -> torch.Tensor:
+      return self.vlm.get_input_embeddings(input_ids, multimodal_embeddings)
+```
+`reasoning_vla_vllm_wrapper.py`中还有一个比较重要的函数`load_weights`，它的主要功能是把原始 vla checkpoint 里的权重加载到 vllm wrapper 模型里。由于 vla 模型和 vllm wrapper 模型在结构上有一些差异，所以不能直接把 checkpoint 权重加载到 wrapper 模型里，而是需要先通过 `ReasoningVLAWeightMapper` 把 checkpoint 里的权重名映射成 vllm wrapper 可用的权重名，然后再加载权重，这一部分要与下一部分的 weight mapper 代码配合使用。
+#### Weight Mapper 代码介绍
+为了实现各层参数的加载，我们需要解决各个后端（Policy 训练模型、vLLM rollout 模型、HF checkpoint）之间的参数命名不一致问题，即**三种模型命名空间之间的对齐问题**。
+核心不是“一个名字固定转成另一个名字”，而是：
+```text
+Weight Mapper 中做：
+Policy 训练模型里的参数名
+        ↓
+HF canonical key-space 对应的参数名并存入 inplace_map
+        ↑
+vLLM rollout 模型里的参数名
+
+Wrapper 中做：
+Checkpoint 里读出来的 raw key
+        ↓
+load_weights.normalize() 生成其在 HF canonical key-space 中可能对应的候选 key
+        ↓
+去 inplace_map 里找 vLLM 目标参数
+```
+
+---
+
+##### 1. 先分清楚有几套名字
+
+这段代码里至少有 4 种 key-space。
+
+| 名称空间                         | 代表含义                                | 例子                                                         |
+| ---------------------------- | ----------------------------------- | ---------------------------------------------------------- |
+| **Policy local key**         | 训练侧 ReasoningVLA 模型里的参数名            | `reasoning_vla.vlm.model.language_model.model.layers.0...` |
+| **Rollout / vLLM local key** | vLLM 内部 `self.vlm` 里的参数名            | `vlm.model.layers.0...` 或 `llm.model.layers.0...`          |
+| **HF canonical key**         | 统一中间格式，接近 HuggingFace checkpoint 命名 | `model.layers.0...`、`visual.blocks.0...`                   |
+| **Raw checkpoint key**       | `load_weights(weights)` 里读出来的原始权重名  | 可能是 `language_model.xxx`、`vlm.xxx`、`visual.xxx`            |
+
+`weight_mapper.py` 的主要目标是：
+**把 Policy local key 和 Rollout/vLLM local key 都映射到同一个 HF canonical key-space。**
+
+而 `normalize()` 的主要目标是：
+**把 checkpoint 里读出来的 raw key 变成若干个可能匹配 `inplace_map` 的候选 key。**
+
+---
+
+##### 2. `weight_mapper.py` 到底在干什么？
+
+`ReasoningVLAWeightMapper` 的 docstring 已经说明它是做 **ReasoningVLA policy、vLLM rollout、HF checkpoint 三者之间的 weight-name mapper**。
+
+它主要有两个方向。
+
+- 2.1 Policy local key → HF canonical key
+
+  函数：
+
+  ```python
+  def policy_map_local_key_to_hf_key(self, name: str) -> str:
+  ```
+
+  它的注释明确写了两个例子：
+
+  ```text
+  reasoning_vla.vlm.model.language_model.* -> model.*
+  reasoning_vla.vlm.model.visual.*         -> visual.*
+  ```
+
+  代码里面也确实做了这些 rewrite：
+
+  ```python
+  ("reasoning_vla.", "")
+  ("vlm.", "")
+  ("model.language_model.", "model.")
+  ("model.visual.", "visual.")
+  ```
+
+  也就是说，这个函数是把 **训练侧 ReasoningVLA 模型的参数名** 转成 **HF 风格的统一名字**。
+
+  举例：
+
+  ```text
+  Policy local:
+  reasoning_vla.vlm.model.language_model.model.layers.0.self_attn.q_proj.weight
+
+  去掉 reasoning_vla.:
+  vlm.model.language_model.model.layers.0.self_attn.q_proj.weight
+
+  去掉 vlm.:
+  model.language_model.model.layers.0.self_attn.q_proj.weight
+
+  model.language_model. -> model.:
+  model.model.layers.0.self_attn.q_proj.weight
+  ```
+
+  实际最终结果还会经过父类 `super().policy_map_local_key_to_hf_key(name)` 再处理，所以最后不一定就是我上面手动推的字符串，但方向是明确的：
+  **Policy 侧名字 → HF canonical 名字。**
+
+- 2.2 Rollout / vLLM local key → HF canonical key
+
+  函数：
+
+  ```python
+  def rollout_map_local_key_to_hf_key(self, rollout_weight_name: str) -> str:
+  ```
+
+  它处理的是 vLLM 内部参数名，例如：
+
+  ```text
+  llm.model.xxx
+  llm.lm_head.xxx
+  model.vlm.model.visual.xxx
+  vlm.model.visual.xxx
+  vlm.xxx
+  language_model.xxx
+  ```
+
+  然后统一转成 HF canonical key。对应代码是：
+
+  ```python
+  if name.startswith("llm.model."):
+      name = name.replace("llm.model.", "model.", 1)
+  elif name.startswith("llm.lm_head."):
+      name = name.replace("llm.lm_head.", "lm_head.", 1)
+  elif name.startswith("model.vlm.model.visual."):
+      name = name.replace("model.vlm.model.visual.", "visual.", 1)
+  elif name.startswith("vlm.model.visual."):
+      name = name.replace("vlm.model.visual.", "visual.", 1)
+  elif name.startswith("vlm."):
+      name = name[len("vlm.") :]
+  ```
+
+  后面又继续处理 `language_model.` 前缀，以及 `visual.attn.qkv_proj` 到 `visual.attn.qkv` 的差异。
+
+  所以这个函数的方向是：
+
+  ```text
+  vLLM local key
+      ↓
+  HF canonical key
+  ```
+
+  例如：
+
+  ```text
+  vLLM local:
+  vlm.model.visual.blocks.0.attn.qkv_proj.weight
+
+  rollout_map_local_key_to_hf_key:
+  visual.blocks.0.attn.qkv.weight
+  ```
+
+---
+
+##### 3. 那 `load_weights()` 里面为什么还要 `normalize()`？
+
+关键在这里：
+
+```python
+mapper = ReasoningVLAWeightMapper(self._orig_hf_config_for_mapper)
+mapper.setup_rollout_backend("vllm")
+inplace_map, _ = mapper.rollout_prepare_recv(self.vlm)
+```
+
+这三行表示：先创建 mapper，然后告诉它当前 rollout backend 是 vLLM，最后针对 `self.vlm` 准备一个接收权重的 `inplace_map`。
+
+从后面的用法可以看出来，`inplace_map` 大致是这种结构：
+
+```python
+{
+    "model.layers.0.self_attn.q_proj.weight": <vLLM target tensor>,
+    "visual.blocks.0.attn.qkv.weight": <vLLM target tensor>,
+    ...
+}
+```
+
+也就是：
+
+```text
+HF canonical key -> vLLM 真实参数 tensor
+```
+
+然后主循环这样做：
+
+```python
+for raw_name, tensor in weights:
+    for key in normalize(raw_name):
+        dst = inplace_map.get(key, None)
+```
+
+也就是说，`normalize(raw_name)` 生成的 key 是拿去查 `inplace_map` 的。
+
+所以完整流程是：
+
+```text
+checkpoint raw key
+    ↓ normalize()
+一组候选 key
+    ↓ inplace_map.get(key)
+vLLM target tensor
+    ↓ copy_
+加载权重
+```
+
+---
+
+##### 4. `weight_mapper.py` 和 `normalize()` 的区别
+
+它们都在“改名”，但对象不同。
+
+- 4.1 `weight_mapper.py` 改的是 **模型本身的参数名**
+
+  也就是：
+
+  ```text
+  Policy model named_parameters()
+  Rollout/vLLM model named_parameters()
+  ```
+
+  它的目标是把不同模型内部的参数名统一到 HF canonical key-space。
+
+  图示：
+
+  ```text
+  Policy local key
+  reasoning_vla.vlm.model.language_model.xxx
+          │
+          │ policy_map_local_key_to_hf_key()
+          ↓
+  HF canonical key
+  model.xxx
+
+
+  vLLM local key
+  vlm.model.visual.xxx
+          │
+          │ rollout_map_local_key_to_hf_key()
+          ↓
+  HF canonical key
+  visual.xxx
+  ```
+- 4.2 `normalize()` 改的是 **checkpoint 读出来的 raw key**
+
+  `normalize()` 不关心 policy model，也不遍历 vLLM 参数。
+  它只是面对 `load_weights(weights)` 传进来的 `raw_name`，生成一堆可能可以匹配的候选名字。
+
+  源码中它会处理：
+
+  ```
+  language_model. -> 去掉
+  vlm.xxx -> xxx / model.xxx / visual.xxx
+  model.xxx -> vlm.model.xxx / visual.xxx
+  visual.xxx -> vlm.model.visual.xxx / model.visual.xxx / vlm.visual.xxx
+  attn.proj <-> attn.out_proj
+  attn.qkv <-> attn.qkv_proj
+  qkv -> q/k/v
+  ```
+
+  这些逻辑都在 `normalize()` 里。
+
+---
+
+##### 5. 具体例子
+
+假设 vLLM 内部真实参数名是：
+
+```text
+vlm.model.visual.blocks.0.attn.qkv_proj.weight
+```
+
+`weight_mapper.py` 会把它映射成 HF canonical key：
+
+```text
+visual.blocks.0.attn.qkv.weight
+```
+
+因为 `rollout_map_local_key_to_hf_key()` 里有：
+
+```python
+vlm.model.visual. -> visual.
+.attn.qkv_proj. -> .attn.qkv.
+```
+
+对应代码在 rollout mapper 里。
+
+于是 `rollout_prepare_recv(self.vlm)` 可能会构建类似：
+
+```python
+inplace_map = {
+    "visual.blocks.0.attn.qkv.weight": target_tensor
+}
+```
+
+现在 checkpoint 里读出来的 raw key 可能是：
+
+```text
+raw_name = "vlm.model.visual.blocks.0.attn.qkv_proj.weight"
+```
+
+如果直接查：
+
+```python
+inplace_map.get("vlm.model.visual.blocks.0.attn.qkv_proj.weight")
+```
+
+可能查不到，因为 `inplace_map` 的 key 是 canonical 之后的：
+
+```text
+visual.blocks.0.attn.qkv.weight
+```
+
+所以 `normalize(raw_name)` 会生成多个候选：
+
+```text
+vlm.model.visual.blocks.0.attn.qkv_proj.weight
+model.visual.blocks.0.attn.qkv_proj.weight
+visual.blocks.0.attn.qkv_proj.weight
+vlm.visual.blocks.0.attn.qkv_proj.weight
+visual.blocks.0.attn.qkv.weight
+...
+```
+
+其中如果生成了：
+
+```text
+visual.blocks.0.attn.qkv.weight
+```
+
+就可以命中：
+
+```python
+dst = inplace_map.get("visual.blocks.0.attn.qkv.weight")
+```
+
+然后把 checkpoint tensor copy 到 vLLM 的真实参数里。
