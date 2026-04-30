@@ -587,6 +587,12 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        rollout_custom = config.get("custom", None) or {}
+        sampling_params.update(dict(rollout_custom.get("sampling_params", {}) or {}))
+        if rollout_custom.get("stop_token_ids") is not None:
+            sampling_params["stop_token_ids"] = [int(token_id) for token_id in rollout_custom["stop_token_ids"]]
+        elif rollout_custom.get("eos_token_id") is not None:
+            sampling_params["stop_token_ids"] = [int(rollout_custom["eos_token_id"])]
 
         # override sampling params for validation
         if batch.meta_info.get("validate", False):
