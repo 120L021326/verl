@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 PROJECT_DIR=${PROJECT_DIR:-$(pwd)}
-EXAMPLE_DIR="/workspace/verl/examples/alpamayo_demo"
+EXAMPLE_DIR="/workspace/verl/examples/alpamayo_demo2"
 MODEL_DIR="/workspace/Alpamayo-R1-10B-vlm"
 TOKENIZER_DIR="/workspace/Alpamayo-R1-10B-training/"
 TRAIN_FILE="/workspace/alpamayo_metadata/train.parquet"
