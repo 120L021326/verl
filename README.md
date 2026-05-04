@@ -291,6 +291,12 @@ export VERL_DEBUG_QWEN3_VL=1
 export ALPAMAYO_MODEL_DIR="/workspace/.cache/modelscope/hub/models/nv-community/Alpamayo-R1-10B/"
 export PYTHONPATH="$PWD/alpamayo/src:$PWD/alpamayo/finetune:$PWD/alpamayo/finetune/rl/models"
 export PYTHONPATH="$PWD:$PWD/alpamayo/src"
+export TENSORBOARD_DIR=/workspace/tensorboard_log/alpamayo_demo
+tensorboard --logdir /workspace/tensorboard_log --host 0.0.0.0 --port 6006
+ssh-keygen -R "[43.143.135.22]:43232"
+ssh -p 43232 -L 6006:127.0.0.1:6006 root@43.143.135.22
+http://127.0.0.1:6006
+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
 ```
 ### verl 中有关 3D jagged 的问题（positon ids）
 jagged tensor 是一种特殊的 nested tensor，形状可以是 `(bs,seq)`，但每个 batch 里的 `seq` 长度不一样，其中值的存储方式是一个扁平的 `(total_nnz,)` tensor + 一个 offsets 来记录每条序列的起止位置。

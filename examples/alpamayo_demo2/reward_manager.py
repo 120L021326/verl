@@ -6,6 +6,14 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
 
+TRAJ_FUTURE_START_TOKEN = "<|traj_future_start|>"
+TRAJ_FUTURE_END_TOKEN = "<|traj_future_end|>"
+
+
+def _token_ids(tokenizer, token: str) -> list[int]:
+    token_ids = tokenizer.encode(token, add_special_tokens=False)
+    return [int(token_id) for token_id in token_ids]
+
 
 class AlpamayoSpecialTokenRewardManager(RewardManagerBase):
     """Reward manager for Alpamayo text that must preserve generated special tokens."""
@@ -34,6 +42,9 @@ class AlpamayoSpecialTokenRewardManager(RewardManagerBase):
 
         extra_info["num_turns"] = data_item.non_tensor_batch.get("__num_turns__", None)
         extra_info["rollout_reward_scores"] = data_item.non_tensor_batch.get("reward_scores", {})
+        extra_info["response_token_ids"] = [int(token_id) for token_id in valid_response_ids.tolist()]
+        extra_info["traj_future_start_token_ids"] = _token_ids(self.tokenizer, TRAJ_FUTURE_START_TOKEN)
+        extra_info["traj_future_end_token_ids"] = _token_ids(self.tokenizer, TRAJ_FUTURE_END_TOKEN)
 
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)

@@ -17,6 +17,8 @@ TRAJ_FUTURE_START_TOKEN = "<|traj_future_start|>"
 TRAJ_FUTURE_END_TOKEN = "<|traj_future_end|>"
 TRAJ_TOKEN_PATTERN = re.compile(r"<i(\d+)>")
 TRAJ_VOCAB_SIZE = 3000
+TRAJ_TOKEN_ID_BASE = 151669
+TRAJ_TOKEN_ID_END = TRAJ_TOKEN_ID_BASE + TRAJ_VOCAB_SIZE - 1
 MAX_ABS_MAG_JERK: Final[float] = 8.37
 MAX_ABS_LAT_ACCEL: Final[float] = 4.89
 MAX_LON_ACCEL: Final[float] = 2.40
@@ -180,25 +182,62 @@ def compute_comfort(pred_xyz: torch.Tensor, pred_rot: torch.Tensor) -> dict[str,
     return comfort_metric_dict
 
 
-def _extract_future_segment(solution_str: str) -> str:
+def _extract_future_segment(solution_str: str) -> tuple[str, bool]:
     start_index = solution_str.find(TRAJ_FUTURE_START_TOKEN)
     if start_index < 0:
         raise ValueError(f"response is missing {TRAJ_FUTURE_START_TOKEN}")
     start_index += len(TRAJ_FUTURE_START_TOKEN)
     end_index = solution_str.find(TRAJ_FUTURE_END_TOKEN, start_index)
     if end_index < 0:
-        raise ValueError(f"response is missing {TRAJ_FUTURE_END_TOKEN}")
-    return solution_str[start_index:end_index]
+        return solution_str[start_index:], True
+    return solution_str[start_index:end_index], False
 
 
-def _extract_future_token_ids(solution_str: str) -> list[int]:
-    future_segment = _extract_future_segment(solution_str)
+def _find_subsequence(values: list[int], pattern: list[int], start: int = 0) -> int:
+    if not pattern:
+        return -1
+    last_start = len(values) - len(pattern)
+    for index in range(start, last_start + 1):
+        if values[index : index + len(pattern)] == pattern:
+            return index
+    return -1
+
+
+def _extract_future_token_ids_from_response_ids(extra_info: dict[str, Any]) -> list[int]:
+    response_token_ids = [int(token_id) for token_id in extra_info.get("response_token_ids", [])]
+    future_start_token_ids = [int(token_id) for token_id in extra_info.get("traj_future_start_token_ids", [])]
+    future_end_token_ids = [int(token_id) for token_id in extra_info.get("traj_future_end_token_ids", [])]
+
+    start_index = _find_subsequence(response_token_ids, future_start_token_ids)
+    if start_index < 0:
+        return []
+
+    scan_start = start_index + len(future_start_token_ids)
+    end_index = _find_subsequence(response_token_ids, future_end_token_ids, start=scan_start)
+    scan_end = end_index if end_index >= 0 else len(response_token_ids)
+
+    token_ids = []
+    for token_id in response_token_ids[scan_start:scan_end]:
+        if TRAJ_TOKEN_ID_BASE <= token_id <= TRAJ_TOKEN_ID_END:
+            token_ids.append(token_id - TRAJ_TOKEN_ID_BASE)
+    return token_ids
+
+
+def _extract_future_token_ids(solution_str: str, extra_info: dict[str, Any]) -> tuple[list[int], bool, str]:
+    future_segment, missing_future_end = _extract_future_segment(solution_str)
+
+    if missing_future_end:
+        token_ids_from_response = _extract_future_token_ids_from_response_ids(extra_info)
+        if token_ids_from_response:
+            return token_ids_from_response, True, "response_token_ids_missing_future_end"
+
     token_ids = []
     for raw_token_id in TRAJ_TOKEN_PATTERN.findall(future_segment):
         token_id = int(raw_token_id)
         if 0 <= token_id < TRAJ_VOCAB_SIZE:
             token_ids.append(token_id)
-    return token_ids
+    decode_source = "decoded_traj_future_tokens_missing_future_end" if missing_future_end else "decoded_traj_future_tokens"
+    return token_ids, missing_future_end, decode_source
 
 
 def _pad_or_truncate_tokens(token_ids: list[int], expected_len: int) -> list[int]:
@@ -273,9 +312,9 @@ def _decode_prediction_from_solution(
     solution_str: str,
     extra_info: dict[str, Any],
     model_path: str,
-) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+) -> tuple[torch.Tensor, torch.Tensor, int, int, str, bool]:
     config, traj_tokenizer = _load_discrete_trajectory_tokenizer(model_path)
-    token_ids = _extract_future_token_ids(solution_str)
+    token_ids, missing_future_end, decode_source = _extract_future_token_ids(solution_str, extra_info)
     if not token_ids:
         raise ValueError("response contains no discrete future trajectory tokens")
 
@@ -290,7 +329,7 @@ def _decode_prediction_from_solution(
         hist_rot=history_rot,
         tokens=tokens.to(history_xyz.device),
     )
-    return pred_xyz[0], pred_rot[0], raw_token_count, expected_len
+    return pred_xyz[0], pred_rot[0], raw_token_count, expected_len, decode_source, missing_future_end
 
 
 def _resolve_model_path(extra_info: dict[str, Any], model_path: str | None) -> str:
@@ -308,7 +347,7 @@ def _trajectory_reward(pred_xyz: torch.Tensor, pred_rot: torch.Tensor, gt_xyz: t
     ade = calculate_ade(pred_xyz, gt_xyz)
     comfort_dict = compute_comfort(pred_xyz[None, None, None], pred_rot[None, None, None])
     comfort = float((sum(value.mean() for value in comfort_dict.values()) / len(comfort_dict)).item()) - 1.0
-    reward = -1.0 if ade >= 3.0 else -(ade / 3.0) + 0.1 * comfort
+    reward = -1.0 if ade >= 3.0 else -0.4 * (ade / 3.0) + 0.1 * comfort
     return reward, ade, comfort
 
 
@@ -331,7 +370,7 @@ def compute_score(
 
     resolved_model_path = _resolve_model_path(extra_info, model_path)
     gt_xyz = _as_trajectory_xyz(extra_info["ego_future_xyz"], "ego_future_xyz")
-    pred_xyz, pred_rot, raw_token_count, expected_token_count = _decode_prediction_from_solution(
+    pred_xyz, pred_rot, raw_token_count, expected_token_count, decode_source, missing_future_end = _decode_prediction_from_solution(
         solution_str,
         extra_info,
         resolved_model_path,
@@ -347,6 +386,7 @@ def compute_score(
         "trajectory_reward": reward,
         "discrete_action_token_count": raw_token_count,
         "expected_discrete_action_token_count": expected_token_count,
-        "reward_decode_source": "decoded_traj_future_tokens",
+        "reward_decode_source": decode_source,
+        "missing_traj_future_end": float(missing_future_end),
         "reward_decode_error": "",
     }
