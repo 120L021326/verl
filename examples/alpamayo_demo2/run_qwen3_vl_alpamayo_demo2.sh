@@ -2,9 +2,9 @@
 set -xeuo pipefail
 
 PROJECT_DIR=${PROJECT_DIR:-$(pwd)}
-EXAMPLE_DIR="/workspace/verl/examples/alpamayo_demo2"
-MODEL_DIR="/workspace/Alpamayo-R1-10B-vlm"
-TOKENIZER_DIR="/workspace/Alpamayo-R1-10B-training/"
+EXAMPLE_DIR="/workspace/verl/examples/alpamayo_demo2" # 项目路径文件夹
+MODEL_DIR="/workspace/Alpamayo-R1-10B-vlm" # alpamayo的vlm模型文件夹，需要是Qwen3VL架构的
+TOKENIZER_DIR="/workspace/Alpamayo-R1-10B-training/" # 需要alpamayo的原config文件中的traj_tokenizer_cfg相关配置
 TRAIN_FILE="/workspace/alpamayo_metadata/train.parquet"
 VAL_FILE="/workspace/alpamayo_metadata/val.parquet"
 ENGINE=${ENGINE:-vllm}
