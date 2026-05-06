@@ -17,7 +17,7 @@ python3 -m verl.trainer.main_ppo \
     data.custom_cls.path="$EXAMPLE_DIR/dataset2.py" \
     data.custom_cls.name=AlpamayoDemoDataset2 \
     data.train_batch_size=8 \
-    data.max_prompt_length=3000 \
+    data.max_prompt_length=3000 \ # 4096
     data.max_response_length=256 \
     data.filter_overlong_prompts=False \
     data.dataloader_num_workers=0\
@@ -36,12 +36,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=12 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.max_model_len=3300\
+    actor_rollout_ref.rollout.max_model_len=3300\ # 4352
     actor_rollout_ref.rollout.max_num_seqs=8\
-    actor_rollout_ref.rollout.max_num_batched_tokens=26400\
+    actor_rollout_ref.rollout.max_num_batched_tokens=26400\ # 34816
     actor_rollout_ref.rollout.gpu_memory_utilization=0.2\
-    actor_rollout_ref.rollout.enforce_eager=True\
-    actor_rollout_ref.rollout.enable_prefix_caching=False\
+    actor_rollout_ref.rollout.enforce_eager=True\ False
+    actor_rollout_ref.rollout.enable_prefix_caching=False\ True
     actor_rollout_ref.rollout.tensor_model_parallel_size=8\
     actor_rollout_ref.rollout.temperature=0.6\
     actor_rollout_ref.rollout.top_p=0.98\

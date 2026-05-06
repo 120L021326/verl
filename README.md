@@ -1968,3 +1968,52 @@ dst = inplace_map.get("visual.blocks.0.attn.qkv.weight")
 ```
 
 然后把 checkpoint tensor copy 到 vLLM 的真实参数里。
+
+### 运行 reward 曲线
+![](./imgs/verl/reward曲线.png)
+
+### 性能分析
+配置：
+```
+平台：8x A6000
+batch_size: 8
+rollout.n: 12
+ppo_minibatch_size: 8
+ppo_microbatch_size: 1
+rollout.max_model_len：3456（3200 prompt + 256 response）
+rollout.max_num_seqs：48
+rollout.max_num_batched_tokens：41472
+rollout.enforce_eager：False
+rollout.enable_prefix_caching：True
+```
+性能：
+```
+|- step: 196587.307 ms
+    |- gen: 43181.498 ms (21.96% of step)
+        |- agent_loop.generate_sequences: 26989.679 ms max / 22690.012 ms mean / 16793.776 ms min
+        |   |- slowest generate_sequences: 25994.798 ms (60.19% of gen, 13.22% of step)
+        |- agent_loop.compute_score: 4046.122 ms max / 1026.697 ms mean / 185.611 ms min
+        |   |- slowest compute_score: 4046.122 ms (9.37% of gen, 2.06% of step)
+        |- gen_other: 13140.579 ms (30.43% of gen, 6.68% of step)
+    |- reward: 0.028 ms (~0% of step)
+    |- old_log_prob: 48224.802 ms (24.53% of step)
+    |- adv: 2.631 ms (~0% of step)
+    |- update_actor: 99834.472 ms (50.78% of step)
+    |- update_weights: 5295.993 ms (2.69% of step)
+    |- start_profile: 0.080 ms (~0% of step)
+    |- stop_profile: 0.135 ms (~0% of step)
+
+|- tokens
+    |- total_num_tokens: 302340
+    |- global_seqlen: 37792.5 mean / 37843 max / 37731 min
+    |- prompt_length: 3006 mean / 3006 max / 3006 min
+    |- response_length: 143.375 mean / 159 max / 138 min
+    |- response_aborted_ratio: 0
+    |- prompt_clip_ratio: 0
+    |- response_clip_ratio: 0
+
+|- throughput
+    |- perf.throughput: 192.243 tokens/s/GPU
+    |- timing_per_token.gen: 3.137 ms/token
+    |- timing_per_token.update_actor: 0.330 ms/token
+```
