@@ -1969,42 +1969,138 @@ dst = inplace_map.get("visual.blocks.0.attn.qkv.weight")
 
 然后把 checkpoint tensor copy 到 vLLM 的真实参数里。
 
+##### 6. 注意
+这个 vllm 适配只适配了从 checkpoint 加载权重的部分，但没有适配从多卡 actor 通过 CUDA IPC 同步权重到 vLLM rollout 模型的部分，也就是说该 vllm warpper 无法将 fsdp key 通过 normalize 转换为合适的候选来加载权重，所以在当前实现里，vllm rollout 模型的权重只能来自 checkpoint 加载，而不能来自 actor 同步。通常来说，将 fsdp key 转换为 vllm load_weights 可接受的 key 这一步是在框架中实现的， verl 中的[model.py](verl\utils\model.py)中就有 convert_weight_keys 函数，将 Transformers 内部 key 映射回 checkpoint/HF key。
+
 ### load_weights()通信学习
-**ZMQ IPC 通道是什么**
+**1. NCCL 是什么？**
 
-ZMQ 可以理解成一种进程间通信库。IPC 是 inter-process communication，也就是同一台机器上两个进程之间通信。
+多卡训练时，每张 GPU 只负责一部分计算。问题是：
+```
+GPU-0 有一部分数据
+GPU-1 有一部分数据
+GPU-2 有一部分数据
+GPU-3 有一部分数据
+```
+但训练过程中经常需要把这些数据合并、同步、分发。
 
-这里的 ZMQ IPC 通道就是一个本机 socket 文件地址，例如：
+例如：
+```
+1. DDP 需要把所有 GPU 的 gradient 求平均
+2. FSDP 需要在 forward 前 all-gather 参数
+3. FSDP 需要在 backward 后 reduce-scatter gradient
+4. Tensor Parallel 需要在层之间交换 activation
+5. ZeRO/FSDP 需要同步 optimizer/parameter shard
+```
+NCCL 就是专门做这些 GPU-to-GPU 通信的。
+**2. ZMQ IPC 是什么？**
+
+ZMQ 是 ZeroMQ，一个消息通信库。`ipc://...` 是 ZeroMQ 的本机进程间通信 transport，用来让同一台机器上的两个进程发消息；官方文档也把它定义为 local processes 之间的 inter-process transport。([api.zeromq.org][1])
+
+在 RL colocate 场景里，通常有两个进程：
 
 ```text
-ipc:///tmp/rl-colocate-zmq-GPU_UUID.sock
+训练进程 / actor worker
+    |
+    |  ZMQ IPC 消息
+    v
+vLLM 推理进程 / rollout worker
 ```
 
-actor 进程在这个地址上发送信息，vLLM 进程在这个地址上接收信息。
-
-但注意：真正的大 tensor 不是通过 ZMQ 消息本身传过去的。ZMQ 主要传：
+但 ZMQ 消息本身不适合传几十 GB 的模型权重。它一般只传很小的控制信息，例如：
 
 ```text
-CUDA IPC handle
-bucket metadata
-tensor name
+param name
 shape
 dtype
-offset
+bucket offset
+CUDA IPC handle
+同步信号
 ```
 
-真正的权重数据在 GPU buffer 里，通过 CUDA IPC 让另一个进程访问。
-
-可以把它理解成：
+所以它更像：
 
 ```text
-ZMQ：传“钥匙”和目录
-CUDA IPC：共享 GPU 上真正的权重 bucket
+ZMQ = 传说明书 + 钥匙
+```
+
+而不是：
+
+```text
+ZMQ = 搬运整套权重
 ```
 
 ---
 
-**为什么 vLLM 需要的权重不会“只在另一张卡上”**
+**3. CUDA IPC 是什么？**
+
+CUDA IPC 是 CUDA 提供的 **GPU 显存跨进程共享机制**。
+
+正常情况下，两个进程各有自己的地址空间：
+
+```text
+Process A:
+    ptr_A -> GPU buffer
+
+Process B:
+    看不到 ptr_A
+```
+
+即使它们在同一张 GPU 上，Process B 也不能直接拿 Process A 的 CUDA 指针用。CUDA 指针属于某个进程的 CUDA context。
+
+CUDA IPC 的流程大概是：
+
+```cpp
+// Process A
+cudaMalloc(&ptr_A, size);
+cudaIpcGetMemHandle(&handle, ptr_A);
+
+// 把 handle 通过 ZMQ / pipe / socket 传给 Process B
+
+// Process B
+cudaIpcOpenMemHandle(&ptr_B, handle, flags);
+```
+
+NVIDIA 文档里，`cudaIpcGetMemHandle` 的作用是给已有的 device memory allocation 生成 interprocess memory handle；`cudaIpcOpenMemHandle` 会用这个 handle 在另一个进程中获得一个可用的 device pointer。([NVIDIA Docs][2])
+
+于是 Process B 得到的不是原始的 `ptr_A`，而是自己进程里的一个新指针 `ptr_B`：
+
+```text
+Process A:
+    ptr_A ───────┐
+                 │ 指向同一块 GPU 显存 allocation
+Process B:       │
+    ptr_B ───────┘
+```
+
+这就是“真正的权重数据在 GPU buffer 里，通过 CUDA IPC 让另一个进程访问”的意思。
+
+---
+
+**4. vLLM 如何 copy 一份权重？**
+
+vllm获得更新权重的流程是：
+
+```text
+actor / trainer:
+    1. 从 FSDP state_dict 得到逻辑参数
+    2. FSDP NCCL all_gather / all_to_all / reshard 得到本卡 vLLM 需要的参数数据，在verl中是 all_gather 到每张卡都有完整参数数据
+    3. 把参数数据写入一个 GPU bucket buffer
+    4. 导出这个 bucket 的 CUDA IPC handle
+
+ZMQ:
+    5. 把 handle + metadata 发给 vLLM
+
+vLLM:
+    6. cudaIpcOpenMemHandle 打开共享 bucket
+    7. 从共享 bucket 读取对应 tensor
+    8. 调用 load_weights()
+    9. 把数据加载 / copy / slice 到 vLLM 自己的模型权重 storage
+```
+
+---
+
+**5. 为什么 vLLM 需要的权重不会“只在另一张卡上”**
 
 你的疑问是核心点：
 
@@ -2085,7 +2181,7 @@ GPU-3 vLLM 再从这些逻辑参数里加载自己 TP rank 需要的部分
 
 ---
 
-**那是不是每张卡都会重复拿一份完整权重？**
+**6. 那是不是每张卡都会重复拿一份完整权重？**
 
 在概念上，是接近这个意思：每个 actor rank 都会遍历 state_dict，给本地 vLLM worker 提供它需要加载的权重流。
 
@@ -2101,7 +2197,7 @@ param.full_tensor() if isinstance(param, DTensor) else param.to(device)
 
 ---
 
-**一个简化例子**
+**7. 一个简化例子**
 
 假设某个权重是：
 
@@ -2139,12 +2235,366 @@ verl 的正确做法是：
 FSDP state_dict 还原/暴露 W
 vLLM TP rank i 从 W 里切自己需要的部分
 ```
+---
+**8. NCCL、CUDA IPC、ZMQ 的区别**
+| 组件       | 主要作用                     | 传什么                              | 通信对象          |
+| -------- | ------------------------ | -------------------------------- | ------------- |
+| ZMQ IPC  | 控制面通信                    | metadata、handle、name、shape、dtype | 本机进程之间        |
+| CUDA IPC | 共享 GPU memory allocation | GPU buffer handle                | 本机进程之间        |
+| NCCL     | 多 GPU collective 通信      | 大 Tensor 数据                      | 多 GPU / 多进程之间 |
+
+---
+### FSDP 中的 SHARDED_STATE_DICT 介绍
+**FSDP1 的 `SHARDED_STATE_DICT` 可以理解成：**
+
+> 用“原始参数名 + 原始参数形状”的方式暴露模型参数，但每个参数的值不是完整 Tensor，而是一个带全局 metadata 的分布式分片 Tensor。
+
+它不是 FSDP 内部真正存的那种 **flat parameter shard**，也不是每张卡上直接拿到的完整权重。
 
 ---
 
-一句话：
+**1. 先区分 FSDP1 里的三种 state dict**
 
-> ZMQ IPC 是本机两个进程建立联系和传 metadata/handle 的通道；真正权重通过 CUDA IPC 的 GPU buffer 共享。虽然 FSDP shard 不等于 vLLM TP shard，但 update_weights 不是直接发送本地 FSDP shard，而是通过 FSDP state_dict 得到逻辑权重，再由 vLLM 的 `load_weights()` 根据 TP rank 切出自己需要的权重。
+PyTorch FSDP 支持三类 state dict：
+
+| 类型                   | 参数名       | 参数形状                | 每个 rank 拿到什么        | 主要用途                    |
+| -------------------- | --------- | ------------------- | ------------------- | ----------------------- |
+| `FULL_STATE_DICT`    | 原始参数名     | 原始完整形状              | 完整参数                | 单机保存、普通 HuggingFace 加载  |
+| `LOCAL_STATE_DICT`   | FSDP 内部形式 | 通常是 flattened shard | 本 rank 的 flat shard | 只对 FSDP 自己有意义           |
+| `SHARDED_STATE_DICT` | 原始参数名     | 原始完整形状              | 分片参数对象              | 分布式 checkpoint、跨并行方式重切分 |
+
+PyTorch 文档明确说，FSDP 的 sharded state dict 是 **sharded, unflattened parameters**，也就是“分片的、但已经还原成原始参数语义的参数”。`LOCAL_STATE_DICT` 才是 local sharded flattened parameters，只对 FSDP 有意义；而 `SHARDED_STATE_DICT` 可以被其他并行方式使用，但可能需要 resharding。([GitHub][1])
+
+---
+
+**2. FSDP1 内部参数和 `SHARDED_STATE_DICT` 的区别**
+
+假设原模型有参数：
+
+```text
+model.layers.0.mlp.up_proj.weight
+shape = [8192, 4096]
+```
+
+FSDP1 内部为了省显存，可能会把很多参数 flatten 成一个大 buffer：
+
+```text
+FlatParameter = concat(
+    q_proj.weight,
+    k_proj.weight,
+    v_proj.weight,
+    up_proj.weight,
+    ...
+)
+```
+
+然后按 data parallel rank 切分：
+
+```text
+rank0: FlatParameter[0:25%]
+rank1: FlatParameter[25%:50%]
+rank2: FlatParameter[50%:75%]
+rank3: FlatParameter[75%:100%]
+```
+
+这叫 **FSDP 内部存储格式**。
+
+但是当你调用：
+
+```python
+FSDP.set_state_dict_type(
+    model,
+    StateDictType.SHARDED_STATE_DICT,
+    ShardedStateDictConfig()
+)
+
+state = model.state_dict()
+```
+
+FSDP 不会直接返回：
+
+```text
+_flat_param
+```
+
+而是返回类似：
+
+```python
+{
+    "model.layers.0.self_attn.q_proj.weight": ShardedTensor(...),
+    "model.layers.0.self_attn.k_proj.weight": ShardedTensor(...),
+    "model.layers.0.mlp.up_proj.weight": ShardedTensor(...),
+    ...
+}
+```
+
+也就是说，**名字和形状恢复成了原始模型的逻辑参数**。
+
+但每个 value 仍然不是完整普通 Tensor，而是类似：
+
+```text
+ShardedTensor(
+    global_shape = [8192, 4096],
+    local_shard = 当前 rank 持有的一段,
+    shard_metadata = 每个 shard 在 global tensor 里的 offset / size / placement
+)
+```
+
+PyTorch 文档中 `ShardedStateDictConfig` 说明，`SHARDED_STATE_DICT` 默认保存为 `ShardedTensor`，如果 `_use_dtensor=True` 才保存为 `DTensor`；这个字段是 FSDP 内部使用的私有字段。([PyTorch Documentation][2])
+
+---
+
+**3. 它“不是完整 Tensor”，但也“不是裸 FSDP shard”**
+
+
+- 裸 FSDP shard 是这样：
+
+  ```text
+  rank3 只知道：
+  FlatParameter[75%:100%]
+  ```
+
+  它可能横跨多个原始参数，也可能只覆盖某个参数的一部分。这个格式对外部系统几乎没法直接用。
+
+- FSDP1 sharded state dict 是这样：
+
+  ```text
+  rank3 知道：
+  参数名：model.layers.0.mlp.up_proj.weight
+  全局形状：[8192, 4096]
+  当前 rank 拥有的局部分片：比如 W[6144:8192, :]
+  这个分片在全局 tensor 中的 offset 是 [6144, 0]
+  ```
+
+  所以它保留了完整的**逻辑参数语义**。
+
+  这就是为什么它比 local flat shard 更有用。
+
+---
+
+**4. 一个具体例子**
+
+假设完整权重：
+
+```text
+W shape = [8, 8]
+```
+
+FSDP world size = 4。
+
+`SHARDED_STATE_DICT` 中每个 rank 可能看到：
+
+```text
+rank0:
+W global shape = [8, 8]
+local shard = W[0:2, :]
+offset = [0, 0]
+size = [2, 8]
+
+rank1:
+W global shape = [8, 8]
+local shard = W[2:4, :]
+offset = [2, 0]
+size = [2, 8]
+
+rank2:
+W global shape = [8, 8]
+local shard = W[4:6, :]
+offset = [4, 0]
+size = [2, 8]
+
+rank3:
+W global shape = [8, 8]
+local shard = W[6:8, :]
+offset = [6, 0]
+size = [2, 8]
+```
+
+从单个 rank 看，它只有局部分片；从所有 rank 合起来看，它们共同表示完整的：
+
+```text
+W[0:8, 0:8]
+```
+
+---
+
+**5. 它解决了什么问题？**
+
+它解决的不是“让每个 rank 自动拿到完整权重”，而是解决：
+
+> FSDP 内部 flat shard 格式太特殊，其他系统无法理解的问题。
+
+`SHARDED_STATE_DICT` 把 FSDP 内部格式转成了一个更通用的表达：
+
+```text
+原始参数名
+原始参数 shape
+当前 shard 的 offset
+当前 shard 的 size
+当前 shard 的 placement
+```
+
+这样后续就可以做：
+
+```text
+保存 checkpoint
+加载 checkpoint
+reshard 到另一种并行方式
+转换成 TP shard
+转换成普通完整权重
+```
+
+---
+
+**6. 和 vLLM TP shard 的关系**
+
+你之前的问题是：
+
+> FSDP shard 不等于 vLLM TP shard，那 GPU-3 上的 vLLM 需要的 TP shard 会不会在 GPU-2 的 FSDP shard 里？
+
+答案是：**会，完全可能。**
+
+例如：
+
+```text
+完整 W shape = [8, 8]
+```
+
+FSDP 按 row shard：
+
+```text
+FSDP rank0: W[0:2, :]
+FSDP rank1: W[2:4, :]
+FSDP rank2: W[4:6, :]
+FSDP rank3: W[6:8, :]
+```
+
+而 vLLM TP 可能按 column shard：
+
+```text
+TP rank0: W[:, 0:2]
+TP rank1: W[:, 2:4]
+TP rank2: W[:, 4:6]
+TP rank3: W[:, 6:8]
+```
+
+那么 GPU-3 上的 vLLM TP rank3 需要：
+
+```text
+W[:, 6:8]
+```
+
+这部分数据分散在所有 FSDP ranks 上：
+
+```text
+rank0 有 W[0:2, 6:8]
+rank1 有 W[2:4, 6:8]
+rank2 有 W[4:6, 6:8]
+rank3 有 W[6:8, 6:8]
+```
+
+所以 GPU-3 的 vLLM 需要的数据确实不只在 GPU-3 的 FSDP shard 里。
+
+---
+
+**7. 那 FSDP1 sharded state dict 如何帮助解决？**
+
+它提供了足够的 metadata，让框架知道：
+
+```text
+每个 rank 手里有什么 shard
+这些 shard 属于哪个原始参数
+这些 shard 在完整参数中的位置
+目标 vLLM TP rank 需要完整参数的哪一段
+```
+
+然后框架可以做 reshard。
+
+概念流程是：
+
+```text
+FSDP sharded state_dict:
+    W 被表示成多个 ShardedTensor shards
+
+reshard / gather / slice:
+    根据 vLLM TP rank 需要的切分方式，重新组合需要的部分
+
+vLLM load_weights:
+    加载自己的 TP shard
+```
+
+所以关键不是：
+
+```text
+FSDP rank3 的 shard 直接给 vLLM rank3
+```
+
+而是：
+
+```text
+FSDP sharded state dict 描述了全局 W 的分片布局
+框架通过通信把 vLLM rank3 需要的 W[:, 6:8] 组合出来
+再交给 vLLM rank3
+```
+
+---
+
+**8. 它和 `full_tensor()` 的关系**
+
+如果 state dict value 是 `DTensor`，你可能会看到类似：
+
+```python
+param.full_tensor()
+```
+
+这表示把分布式 tensor 还原成完整普通 Tensor。
+
+但对于 FSDP1 默认的 `ShardedTensor`，逻辑上更像：
+
+```text
+当前 rank 只持有 local_shard
+对象里带有 global metadata
+需要通过分布式 checkpoint / reshard / all_gather 机制来恢复或重切
+```
+
+所以不要把 FSDP1 的 `SHARDED_STATE_DICT` 理解成：
+
+```text
+每个 rank 都直接拿到完整 Tensor
+```
+
+更准确是：
+
+```text
+每个 rank 拿到一个“逻辑完整、物理分片”的 state_dict
+```
+
+---
+
+**9. 总结**
+
+**FSDP1 的 `SHARDED_STATE_DICT` 不是本地 flat shard，也不是完整权重副本；它是用原始参数名和原始参数形状表示的分布式分片 state dict。**
+
+它的核心价值是：
+
+```text
+把 FSDP 内部的 flat/shard 存储格式
+转换成
+外部系统可以理解的 “参数名 + 全局形状 + shard metadata + local shard”
+```
+
+然后其他系统，例如 checkpoint loader、vLLM weight loader、RL 框架的 weight sync 模块，才能基于这个表示做：
+
+```text
+gather
+reshard
+slice
+broadcast
+CUDA IPC 共享
+load_weights
+```
+
+因此它解决的是**表示和重切分问题**，不是简单地让每张卡凭空拥有所有权重。
 ### 运行 reward 曲线
 ![](./imgs/verl/reward曲线.png)
 
