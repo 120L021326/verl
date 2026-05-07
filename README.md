@@ -1970,7 +1970,7 @@ dst = inplace_map.get("visual.blocks.0.attn.qkv.weight")
 然后把 checkpoint tensor copy 到 vLLM 的真实参数里。
 
 ##### 6. 注意
-这个 vllm 适配只适配了从 checkpoint 加载权重的部分，但没有适配从多卡 actor 通过 CUDA IPC 同步权重到 vLLM rollout 模型的部分，也就是说该 vllm warpper 无法将 fsdp key 通过 normalize 转换为合适的候选来加载权重，所以在当前实现里，vllm rollout 模型的权重只能来自 checkpoint 加载，而不能来自 actor 同步。通常来说，将 fsdp key 转换为 vllm load_weights 可接受的 key 这一步是在框架中实现的， verl 中的[model.py](verl\utils\model.py)中就有 convert_weight_keys 函数，将 Transformers 内部 key 映射回 checkpoint/HF key。
+这个 vllm 适配只适配了从 checkpoint 加载权重的部分，但没有适配从多卡 actor 通过 CUDA IPC 同步权重到 vLLM rollout 模型的部分，也就是说该 vllm warpper 无法将 fsdp key 通过 normalize 转换为合适的候选来加载权重，所以在当前实现里，vllm rollout 模型的权重只能来自 checkpoint 加载，而不能来自 actor 同步。通常来说，将 fsdp key 转换为 vllm load_weights 可接受的 key 这一步是在框架中实现的， verl 中的[model.py](verl/utils/model.py)中就有 convert_weight_keys 函数，将 Transformers 内部 key 映射回 checkpoint/HF key。
 
 ### load_weights()通信学习
 **1. NCCL 是什么？**
@@ -1993,6 +1993,9 @@ GPU-3 有一部分数据
 5. ZeRO/FSDP 需要同步 optimizer/parameter shard
 ```
 NCCL 就是专门做这些 GPU-to-GPU 通信的。
+
+---
+
 **2. ZMQ IPC 是什么？**
 
 ZMQ 是 ZeroMQ，一个消息通信库。`ipc://...` 是 ZeroMQ 的本机进程间通信 transport，用来让同一台机器上的两个进程发消息；官方文档也把它定义为 local processes 之间的 inter-process transport。([api.zeromq.org][1])
