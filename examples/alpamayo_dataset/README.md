@@ -267,7 +267,7 @@ pip install pandas pyarrow numpy torch pillow transformers einops scipy
 ./scripts/build_metadata.sh \
   --data-dir /share/datasets/Alpamayo_pai_av_big \
   --chunk-ids 3116-3120 \
-  --num-samples 1000 \
+  --num-samples 320 \
   --random-seed 42 \
   --force-rebuild
 ```
