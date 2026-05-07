@@ -1969,6 +1969,182 @@ dst = inplace_map.get("visual.blocks.0.attn.qkv.weight")
 
 然后把 checkpoint tensor copy 到 vLLM 的真实参数里。
 
+### load_weights()通信学习
+**ZMQ IPC 通道是什么**
+
+ZMQ 可以理解成一种进程间通信库。IPC 是 inter-process communication，也就是同一台机器上两个进程之间通信。
+
+这里的 ZMQ IPC 通道就是一个本机 socket 文件地址，例如：
+
+```text
+ipc:///tmp/rl-colocate-zmq-GPU_UUID.sock
+```
+
+actor 进程在这个地址上发送信息，vLLM 进程在这个地址上接收信息。
+
+但注意：真正的大 tensor 不是通过 ZMQ 消息本身传过去的。ZMQ 主要传：
+
+```text
+CUDA IPC handle
+bucket metadata
+tensor name
+shape
+dtype
+offset
+```
+
+真正的权重数据在 GPU buffer 里，通过 CUDA IPC 让另一个进程访问。
+
+可以把它理解成：
+
+```text
+ZMQ：传“钥匙”和目录
+CUDA IPC：共享 GPU 上真正的权重 bucket
+```
+
+---
+
+**为什么 vLLM 需要的权重不会“只在另一张卡上”**
+
+你的疑问是核心点：
+
+> FSDP shard 不等于 vLLM TP shard，那 GPU-3 上的 vLLM 需要的 TP shard 会不会在 GPU-2 的 FSDP shard 里？
+
+如果 actor 真的只发送“本地 FSDP shard”，那确实会有这个问题。
+
+但 verl 这里不是简单发送“本地 FSDP shard”。
+
+关键在这里：
+
+```python
+params = self.actor_module_fsdp.state_dict()
+```
+
+FSDP 的 `state_dict()` 不等价于“直接拿本地 flat shard 原样发出去”。verl 前面设置了：
+
+```python
+FSDP.set_state_dict_type(
+    self.actor_module_fsdp,
+    state_dict_type=StateDictType.SHARDED_STATE_DICT,
+    state_dict_config=ShardedStateDictConfig(),
+)
+```
+
+这个 state_dict 是 PyTorch FSDP 的 **逻辑参数 state_dict**。每个参数仍然以原始参数名出现，例如：
+
+```text
+model.layers.0.self_attn.q_proj.weight
+model.layers.0.mlp.up_proj.weight
+...
+```
+
+对于 FSDP2/DTensor 情况，verl 还会做：
+
+```python
+param.full_tensor()
+```
+
+也就是把分布式 tensor 还原成逻辑完整 tensor。
+
+然后 vLLM 侧：
+
+```python
+self.model_runner.model.load_weights(weights)
+```
+
+会根据自己的 TP rank 从这个逻辑 tensor 里切出自己需要的部分。
+
+所以更准确的流程是：
+
+```text
+FSDP 内部存储：
+    每张卡只存参数 shard
+
+update_weights 时：
+    FSDP state_dict 暴露逻辑参数
+    必要时 gather / full_tensor 得到完整参数视图
+    发送给同卡 vLLM 进程
+
+vLLM load_weights：
+    根据当前 TP rank 从完整参数中取自己需要的 shard
+```
+
+因此，不是：
+
+```text
+GPU-3 actor 只拿 GPU-3 的 FSDP shard
+GPU-3 vLLM 被迫只能加载这个 shard
+```
+
+而是：
+
+```text
+GPU-3 actor 在 update_weights 时能通过 FSDP state_dict 得到可加载的逻辑参数
+GPU-3 vLLM 再从这些逻辑参数里加载自己 TP rank 需要的部分
+```
+
+---
+
+**那是不是每张卡都会重复拿一份完整权重？**
+
+在概念上，是接近这个意思：每个 actor rank 都会遍历 state_dict，给本地 vLLM worker 提供它需要加载的权重流。
+
+但具体底层是否每个 tensor 都 materialize 成完整 GPU tensor，取决于 FSDP 版本和 tensor 类型：
+
+```python
+param.full_tensor() if isinstance(param, DTensor) else param.to(device)
+```
+
+对 DTensor 会显式 `full_tensor()`；对 FSDP1 的 sharded state dict，PyTorch 返回的是 ShardedTensor/分片形式，具体行为由 state_dict 类型和后续 tensor 处理决定。
+
+不过设计意图不是“把某张卡的 FSDP shard 直接当成 vLLM shard”，而是走 FSDP state_dict/load_weights 这套逻辑转换。
+
+---
+
+**一个简化例子**
+
+假设某个权重是：
+
+```text
+W shape = [8, 8]
+```
+
+FSDP 可能按 flat parameter 存，例如：
+
+```text
+GPU-0 存 W 的某些连续 flatten shard
+GPU-1 存 W 的另一些 flatten shard
+...
+```
+
+vLLM TP=8 可能需要：
+
+```text
+TP rank 0 需要 W[:, 0:1]
+TP rank 1 需要 W[:, 1:2]
+...
+```
+
+这两个切法不一样。
+
+所以不能直接：
+
+```text
+FSDP GPU-0 shard -> vLLM TP0 shard
+```
+
+verl 的正确做法是：
+
+```text
+FSDP state_dict 还原/暴露 W
+vLLM TP rank i 从 W 里切自己需要的部分
+```
+
+---
+
+一句话：
+
+> ZMQ IPC 是本机两个进程建立联系和传 metadata/handle 的通道；真正权重通过 CUDA IPC 的 GPU buffer 共享。虽然 FSDP shard 不等于 vLLM TP shard，但 update_weights 不是直接发送本地 FSDP shard，而是通过 FSDP state_dict 得到逻辑权重，再由 vLLM 的 `load_weights()` 根据 TP rank 切出自己需要的权重。
 ### 运行 reward 曲线
 ![](./imgs/verl/reward曲线.png)
 
