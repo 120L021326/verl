@@ -73,6 +73,43 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _contains_torch_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, np.ndarray):
+        if value.dtype != object:
+            return False
+        return any(_contains_torch_tensor(item) for item in value.flat)
+    if isinstance(value, dict):
+        return any(_contains_torch_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_torch_tensor(item) for item in value)
+    return False
+
+
+def _drop_conflicting_tensor_non_tensor_batch(base: DataProto, other: DataProto) -> DataProto:
+    """Drop conflicting non-tensor fields that recursively contain tensors.
+
+    DataProto.union compares same-name non-tensor fields for equality. Object
+    fields that contain multi-element tensors cannot participate in that comparison
+    because ``tensor == tensor`` returns a tensor of booleans. Fields that only
+    exist on ``other`` are safe to keep because union will not compare them.
+    """
+    keys_to_drop = [
+        key
+        for key, value in other.non_tensor_batch.items()
+        if key in base.non_tensor_batch
+        and (_contains_torch_tensor(base.non_tensor_batch[key]) or _contains_torch_tensor(value))
+    ]
+    for key in keys_to_drop:
+        other.non_tensor_batch.pop(key, None)
+
+    reward_extra_keys = other.meta_info.get("reward_extra_keys")
+    if reward_extra_keys is not None:
+        other.meta_info["reward_extra_keys"] = [key for key in reward_extra_keys if key not in keys_to_drop]
+    return other
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -575,6 +612,7 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            test_output_gen_batch = _drop_conflicting_tensor_non_tensor_batch(test_batch, test_output_gen_batch)
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
@@ -1407,6 +1445,7 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    gen_batch_output = _drop_conflicting_tensor_non_tensor_batch(batch, gen_batch_output)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():

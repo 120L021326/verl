@@ -514,6 +514,62 @@ actor_rollout_ref.rollout.name="$ENGINE"
 - extra fields
 
 可以把它理解成 verl 内部封装的“异步 LLM 生成客户端”。
+### reward loop 相关结构
+```text
+verl/experimental/reward_loop/reward_loop.py
+        |
+        | 负责创建 reward workers、启动/连接 reward model router、
+        | 通过 load_reward_manager(...) 加载具体 RewardManager
+        v
+path/to/reward_manager.py
+        |
+        | 负责单条样本如何 decode response、组装 extra_info、
+        | 调用 reward_fn.compute_score(...)
+        v
+path/to/reward_fn.py
+```
+
+具体来说：
+
+`reward_loop.py` 是 **verl 框架层**。它做这些事：
+
+- 如果配置了 `reward.reward_model.enable=True`，创建 `RewardModelManager`，启动内部 reward model server。
+- 获取 `reward_router_address`。
+- 创建多个 `RewardLoopWorker`。
+- 在 worker 初始化时调用 `load_reward_manager(...)`。
+- 根据配置把你的自定义 reward manager 类加载进来。
+
+脚本里这几行决定了加载的 manager（例子为AlpamayoSpecialTokenRewardManager）：
+
+```bash
+reward.reward_manager.source=importlib
+reward.reward_manager.name=AlpamayoSpecialTokenRewardManager
+reward.reward_manager.module.path="$EXAMPLE_DIR/reward_manager.py"
+```
+
+所以 `reward_loop.py` 会实例化：
+
+```python
+AlpamayoSpecialTokenRewardManager(...)
+```
+
+`reward_manager.py` 是 **你任务的样本解析层**。它继承 `RewardManagerBase`，主要负责：
+
+- 从 `DataProto` 里取 `responses`
+- 用 tokenizer decode 成 `response_str`
+- 注意这里的例子用的是：
+  ```python
+  skip_special_tokens=False
+  ```
+  这是 Alpamayo 必须的，因为 reward 要看到 `<|cot_end|>` 和 `<|traj_future_start|>`。
+- 把 `response_token_ids`、trajectory special token ids、`extra_info` 塞给 reward function。
+- 如果 `reward_loop.py` 给了 `reward_router_address`，它继续传给配置中指定的 `reward_fn.compute_score(...)`。
+
+也就是说：
+
+- `reward_loop.py`：负责“有没有内部 reward model、router 地址是什么、用哪个 RewardManager”。
+- `reward_manager.py`：负责“这一条 rollout 怎么解码，怎么把必要字段传给具体打分函数”。
+- `reward_fn.py`：负责“怎么算分，包括调用内部 judge”。
 ### alpamayo demo 初始化流程
 下面按当前 `examples/alpamayo_demo/run_qwen3_vl_alpamayo_demo.sh` 和现有代码讲，从初始化到一次训练 step 的完整流程。
 
@@ -2598,6 +2654,143 @@ load_weights
 ```
 
 因此它解决的是**表示和重切分问题**，不是简单地让每张卡凭空拥有所有权重。
+
+### reward 计算路径
+在 verl 这套 PPO/agent loop 路径里，reward 计算位置取决于两个配置：
+
+```bash
+reward.reward_model.enable
+reward.reward_model.enable_resource_pool
+```
+
+**1. 没有 reward model**
+
+配置：
+
+```bash
+reward.reward_model.enable=False
+```
+
+这时 reward 会在 **agent loop worker 里随 rollout 一起算**。
+
+原因是 trainer 里：
+
+```python
+enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+```
+
+没有 RM 时：
+
+```text
+self.use_rm = False
+enable_agent_reward_loop = True
+```
+
+所以 `reward_loop_worker_handles` 会传给 `AgentLoopManager`。rollout 生成完一条样本后，agent loop 直接调用 reward worker 的 `run_single()`，把 reward score 放进输出 batch 的 `rm_scores`。
+
+也就是：
+
+```text
+AgentLoopWorker
+  -> generate response
+  -> RewardLoopWorker / custom reward manager
+  -> reward_fn.compute_score()
+  -> 输出 rm_scores
+```
+
+demo2 基本就是这个路径。
+
+**2. 有 reward model，并且 reward model 用独立资源池**
+
+配置：
+
+```bash
+reward.reward_model.enable=True
+reward.reward_model.enable_resource_pool=True
+```
+
+这时 reward 也可以在 **agent loop 阶段异步/并行计算**。
+
+因为：
+
+```text
+self.use_rm = True
+enable_resource_pool = True
+enable_agent_reward_loop = True
+```
+
+所以 `reward_loop_worker_handles` 仍然会传给 agent loop。reward model server 在单独资源池里运行，agent loop worker 可以通过 reward router 调它。
+
+流程是：
+
+```text
+AgentLoopWorker
+  -> generate response
+  -> RewardLoopWorker
+  -> custom reward_fn
+  -> reward_router_address
+  -> reward model server
+  -> 输出 rm_scores
+```
+
+这种方式需要额外 GPU 资源池。
+
+**3. 有 reward model，但 colocate，不使用独立资源池**
+
+配置：
+
+```bash
+reward.reward_model.enable=True
+reward.reward_model.enable_resource_pool=False
+```
+
+这时 reward 不在 agent loop 里算，而是在 **trainer 侧 rollout 结束后统一计算**。
+
+因为：
+
+```text
+self.use_rm = True
+enable_resource_pool = False
+enable_agent_reward_loop = False
+reward_loop_worker_handles = None
+```
+
+所以 agent loop 只负责生成，不算 reward。生成完成后，trainer 会调用：
+
+```python
+batch_reward = self._compute_reward_colocate(batch)
+batch = batch.union(batch_reward)
+```
+
+流程是：
+
+```text
+Trainer / RayPPOTrainer
+  -> rollout generate_sequences()
+  -> checkpoint_manager.sleep_replicas()
+  -> RewardLoopManager.compute_rm_score()
+  -> RewardLoopWorker / custom reward manager
+  -> reward_fn.compute_score()
+  -> reward_router_address
+  -> colocated reward model server
+  -> batch.union(batch_reward)
+  -> checkpoint_manager.update_weights()
+```
+
+demo3 当前为了单机 8 卡避免额外 GPU，走的就是这个 colocate 路径。
+
+一句话总结：
+
+```text
+无 reward model：
+  reward 在 agent loop worker 中随 rollout 算。
+
+有 reward model + 独立资源池：
+  reward 仍可在 agent loop worker 中算，通过 router 调独立 RM server。
+
+有 reward model + colocate：
+  rollout 先生成，trainer 后处理阶段 sleep actor，再调用 RM 计算 reward。
+```
 ### 运行 reward 曲线
 ![](./imgs/verl/reward曲线.png)
 

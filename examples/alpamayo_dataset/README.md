@@ -208,6 +208,14 @@ metadata 生成脚本。
 - image frames: 4 frames per camera
 - camera: front wide、cross left、cross right、front tele
 
+这里有两个不同的历史窗口，容易混淆：
+
+- **trajectory history window**: 用于 `ego_history_xyz` / `ego_history_rot`。
+  默认 `num_history_steps=16`、`time_step=0.1s`，因此会采样 16 个历史轨迹点：`t0-1.5s, t0-1.4s, ..., t0-0.1s, t0`。代码中还会检查`t0_us > num_history_steps * time_step * 1_000_000`，所以默认要求`t0_us > 1.6s`，否则历史轨迹窗口不足。
+- **image frame window**: 用于 `image_frames`。默认 `num_frames=4`、`time_step=0.1s`，因此每个 camera 取 4 个图像时间点：`t0-0.3s, t0-0.2s, t0-0.1s, t0`。这 4 帧覆盖的是 0.3 秒时间跨度，不是 1.6 秒。
+
+也就是说，虽然每个 camera 默认只取 4 帧图像，但 dataset 同时还会加载1.6 秒左右的 ego trajectory history，并把这段历史轨迹编码进 prompt 中的trajectory tokens。因此用于生成 metadata 的 `t0_us` 需要优先满足轨迹历史窗口，而不仅仅满足图像取帧窗口。
+
 ## 3. 使用步骤
 
 以下步骤假设你已经有本地 PAI 数据目录，例如：
