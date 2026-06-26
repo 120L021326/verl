@@ -8,6 +8,7 @@
 **/playground
 **/wandb
 examples/ref_example
+examples/ref_example2
 
 /pyrightconfig.json
 

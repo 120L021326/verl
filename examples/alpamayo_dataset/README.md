@@ -315,7 +315,16 @@ print("val rows:", len(val))
 print(train.head())
 PY
 ```
+```bash
+python - <<'PY'
+import pandas as pd
 
+train = pd.read_parquet("/workspace/verl/examples/alpamayo_demo3/data/train.parquet")
+
+print("train rows:", len(train))
+print(train.head())
+PY
+```
 ### Step 5: 运行 dataset 验证
 
 `alpamayo_dataset.py` 底部提供了一个简单验证入口：

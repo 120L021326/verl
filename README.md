@@ -292,6 +292,7 @@ export ALPAMAYO_MODEL_DIR="/workspace/.cache/modelscope/hub/models/nv-community/
 export PYTHONPATH="$PWD/alpamayo/src:$PWD/alpamayo/finetune:$PWD/alpamayo/finetune/rl/models"
 export PYTHONPATH="$PWD:$PWD/alpamayo/src"
 export TENSORBOARD_DIR=/workspace/tensorboard_log/alpamayo_demo
+export RAY_record_ref_creation_sites=1 
 tensorboard --logdir /workspace/tensorboard_log --host 0.0.0.0 --port 6006
 ssh-keygen -R "[43.143.135.22]:43232"
 ssh -p 43232 -L 6006:127.0.0.1:6006 root@43.143.135.22
@@ -518,7 +519,7 @@ actor_rollout_ref.rollout.name="$ENGINE"
 ```text
 verl/experimental/reward_loop/reward_loop.py
         |
-        | 负责创建 reward workers、启动/连接 reward model router、
+        | 负责创建 RewardLoopManager，其中会创建 reward workers、启动/连接 reward model router、
         | 通过 load_reward_manager(...) 加载具体 RewardManager
         v
 path/to/reward_manager.py
@@ -531,7 +532,7 @@ path/to/reward_fn.py
 
 具体来说：
 
-`reward_loop.py` 是 **verl 框架层**。它做这些事：
+`reward_loop.py` 是 **verl 框架层**。其中的 `RewardLoopManager` 类做这些事：
 
 - 如果配置了 `reward.reward_model.enable=True`，创建 `RewardModelManager`，启动内部 reward model server。
 - 获取 `reward_router_address`。
@@ -547,7 +548,7 @@ reward.reward_manager.name=AlpamayoSpecialTokenRewardManager
 reward.reward_manager.module.path="$EXAMPLE_DIR/reward_manager.py"
 ```
 
-所以 `reward_loop.py` 会实例化：
+所以 `reward_loop.py` 中的 `RewardLoopWorker` 类会实例化：
 
 ```python
 AlpamayoSpecialTokenRewardManager(...)
@@ -567,9 +568,76 @@ AlpamayoSpecialTokenRewardManager(...)
 
 也就是说：
 
-- `reward_loop.py`：负责“有没有内部 reward model、router 地址是什么、用哪个 RewardManager”。
+- `reward_loop.py`：负责“有没有内部 reward model、router 地址是什么、用哪个 RewardManager”。其中的 Manager、Worker 层级关系与 agentloop 类似，但 reward loop 还要多一个 reward model manager。
 - `reward_manager.py`：负责“这一条 rollout 怎么解码，怎么把必要字段传给具体打分函数”。
 - `reward_fn.py`：负责“怎么算分，包括调用内部 judge”。
+
+针对 RewardModelManager 启动的详细说明：
+在 verl 这里应分成三种情况：
+
+```text
+reward_model.enable = false
+  -> self.use_rm = false
+  -> rm_resource_pool = None
+  -> 不启动 RewardModelManager
+
+reward_model.enable = true 且 enable_resource_pool = false
+  -> Role.RewardModel 映射到 global_pool
+  -> rm_resource_pool = global_pool
+  -> reward model 和 actor/rollout 共用同一个资源池
+  -> 这是 ref_example2 的 colocated/shared global_pool 模式
+
+reward_model.enable = true 且 enable_resource_pool = true
+  -> Role.RewardModel 映射到 reward_pool
+  -> rm_resource_pool = reward_pool
+  -> reward model 使用单独资源池
+  -> 不是和 actor/rollout colocated，而是 extra reward resource pool
+```
+
+代码对应关系在 `main_ppo.py` 里：
+
+```python
+if config.reward.reward_model.enable_resource_pool:
+    resource_pool_spec["reward_pool"] = reward_pool
+else:
+    config.reward.reward_model.nnodes = config.trainer.nnodes
+    config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+```
+
+以及：
+
+```python
+if config.reward.reward_model.enable:
+    if config.reward.reward_model.enable_resource_pool:
+        self.mapping[Role.RewardModel] = "reward_pool"
+    else:
+        self.mapping[Role.RewardModel] = "global_pool"
+```
+
+所以在正常 trainer 中，只要 `reward_model.enable=true`，这里：
+
+```python
+resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+```
+
+通常就是 **非 None**。区别不是 `None / not None`，而是这个 pool 是：
+
+```text
+global_pool  -> 与 actor/rollout 共池
+reward_pool  -> 单独 reward pool
+```
+
+`RewardModelManager` 里的这段：
+
+```python
+if self.resource_pool:
+    server.init_colocated(resource_pool)
+else:
+    server.init_standalone()
+```
+
+这里的 `init_colocated(resource_pool)` 命名容易误导。它更准确的意思是：**用传入的 RayResourcePool / placement group 启动 reward model**。如果传进来的是 `global_pool`，才是和 actor/rollout colocated；如果传进来的是 `reward_pool`，就是独立 reward pool，但仍然走 `init_colocated(resource_pool)` 这条代码路径。
+
 ### alpamayo demo 初始化流程
 下面按当前 `examples/alpamayo_demo/run_qwen3_vl_alpamayo_demo.sh` 和现有代码讲，从初始化到一次训练 step 的完整流程。
 
@@ -1664,6 +1732,373 @@ RewardLoopManager 控 reward workers
 actor_rollout_wg 控 actor/ref 训练计算
 CheckpointEngineManager 控 actor 权重同步到 rollout
 ```
+### rollout sever 与 FSDP 训练 worker 的关系
+`verl/workers/fsdp_workers.py` 里的 rollout 相关函数，核心不是“启动 rollout server”。启动 rollout server 是 `AgentLoopManager -> vLLMReplica/vLLMOmniReplica -> vLLMHttpServer/vLLMOmniHttpServer` 做的。
+
+这个文件里的 rollout 相关逻辑主要负责两件事：
+
+1. 在 FSDP 训练 worker 里创建一个 `self.rollout` wrapper。
+2. 在训练权重更新后，把 FSDP actor 的权重同步到 rollout server 的 vLLM/vLLM-Omni engine。
+
+也就是说，在你当前 async vLLM-Omni 路径里，`fsdp_workers.py` 的 rollout 逻辑更像是 **训练 worker 到 rollout server 的权重同步桥**，不是实际执行 `generate` 的地方。
+
+**角色判断**
+
+`ActorRolloutRefWorker` 初始化时会根据 `role` 设置：
+
+```python
+self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
+self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
+self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+```
+
+你的 worker role 通常是：
+
+```text
+actor_rollout 或 actor_rollout_ref
+```
+
+所以同一个 FSDP worker 同时承担：
+
+```text
+actor: 训练
+rollout: 持有 rollout adapter，用于权重同步
+ref: 如果 actor_rollout_ref，则也可做 reference logprob
+```
+
+这也是为什么这个文件里有 rollout 函数。
+
+**_build_rollout()**
+
+位置大概在：
+
+```python
+def _build_rollout(self, trust_remote_code=False):
+```
+
+作用：在 FSDP worker 内创建 `self.rollout`。
+
+关键代码：
+
+```python
+rollout_config = omega_conf_to_dataclass(self.config.rollout)
+model_config = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+
+infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
+infer_pp = self.config.rollout.pipeline_model_parallel_size
+infer_world_size = infer_tp * infer_pp
+
+rollout_device_mesh = init_device_mesh(
+    device_name,
+    mesh_shape=(dp, infer_tp, infer_pp),
+    mesh_dim_names=["dp", "infer_tp", "infer_pp"],
+)
+
+self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+    config=rollout_config,
+    model_config=model_config,
+    device_mesh=rollout_device_mesh,
+)
+```
+
+如果是普通 HF rollout，`self.rollout` 可能就是本进程内能直接 generate 的 rollout 对象。
+
+但如果是：
+
+```text
+rollout.name = vllm 或 vllm_omni
+rollout.mode = async
+```
+
+那么 `get_rollout_class(...)` 对应的是 vLLM 的 `ServerAdapter` 这类 wrapper。它不是 vLLM engine 本体，而是一个 **客户端/适配器**，后续通过 Ray actor name 找到真正的 server：
+
+```python
+self.server_handle = ray.get_actor(self._get_server_actor_name())
+```
+
+对于 vLLM-Omni，它找的 actor 名字类似：
+
+```python
+vllm_omni_server_{replica_rank}_{node_rank}
+```
+
+所以在你的路径里：
+
+```text
+FSDP worker self.rollout
+  -> ServerAdapter
+    -> vLLMOmniHttpServer actor
+      -> AsyncOmni engine
+```
+
+**rollout_mode()**
+
+这是最关键的函数：
+
+```python
+async def rollout_mode(self):
+```
+
+它的作用不是 generate，而是把当前 FSDP actor 权重同步到 rollout engine。
+
+主要步骤：
+
+1. 清理缓存：
+
+```python
+aggressive_empty_cache(force_sync=True)
+```
+
+2. 如果 actor 参数 offload 到 CPU，先搬回 GPU：
+
+```python
+if self._is_offload_param:
+    load_fsdp_model_to_gpu(self.actor_module_fsdp)
+```
+
+3. 收集 actor/FSDP 参数：
+
+普通模型：
+
+```python
+params = self.actor_module_fsdp.state_dict()
+```
+
+LoRA 模型：
+
+```python
+params = collect_lora_params(...)
+```
+
+如果 LoRA merge：
+
+```python
+params = collect_merged_lora_params(...)
+```
+
+4. 把参数名转换成 rollout backend 能识别的格式：
+
+```python
+params = convert_weight_keys(...)
+```
+
+5. 确保要发送给 rollout engine 的 tensor 在 GPU 上：
+
+```python
+param.to(device, non_blocking=False)
+```
+
+6. 如果 rollout engine sleep/free 了权重，先唤醒 weights：
+
+```python
+if self.config.rollout.free_cache_engine:
+    await self.rollout.resume(tags=["weights"])
+```
+
+7. 真正同步权重：
+
+```python
+await self.rollout.update_weights(
+    per_tensor_param,
+    peft_config=peft_config,
+    base_sync_done=self.base_sync_done,
+)
+```
+
+这里如果 `self.rollout` 是 vLLM/vLLM-Omni 的 `ServerAdapter`，最终会走：
+
+```python
+server_handle.collective_rpc.remote("update_weights_from_ipc", ...)
+BucketedWeightSender.async_send_weights(...)
+```
+
+也就是：
+
+```text
+FSDP worker 参数
+  -> CUDA IPC / shared memory / ZMQ bucket
+  -> vLLM/vLLM-Omni server 内部 engine
+```
+
+8. 权重更新后恢复 KV cache：
+
+```python
+if self.config.rollout.free_cache_engine:
+    await self.rollout.resume(tags=["kv_cache"])
+```
+
+所以 `rollout_mode()` 更准确的含义是：
+
+```text
+准备 rollout engine，使它拥有当前 actor 的最新权重
+```
+
+不是“进入 generate 循环”。
+
+**generate_sequences()**
+
+位置：
+
+```python
+def generate_sequences(self, prompts: DataProto):
+```
+
+这是同步 rollout 时代的 generate 接口。
+
+逻辑：
+
+```python
+assert self._is_rollout
+prompts = prompts.to(get_device_id())
+
+if self._is_actor:
+    loop.run_until_complete(self.rollout_mode())
+
+output = self.rollout.generate_sequences(prompts=prompts)
+
+if self._is_actor:
+    loop.run_until_complete(self.trainer_mode())
+```
+
+它的设计是：
+
+```text
+如果这个 worker 同时是 actor 和 rollout：
+  先 rollout_mode() 同步权重/切换上下文
+  调用 self.rollout.generate_sequences()
+  再 trainer_mode() 切回训练状态
+```
+
+但对你当前的 async vLLM-Omni 路径，这个函数通常不是主 generate 路径。因为 vLLM 的 `ServerAdapter.generate_sequences()` 直接写了：
+
+```python
+raise NotImplementedError(
+    "ServerAdapter does not support synchronous generate_sequences(). "
+    "please use the async server interface via vLLMReplica and AsyncLLMServerManager"
+)
+```
+
+也就是说，vLLM/vLLM-Omni async 模式下，generate 走的是：
+
+```text
+rob_ray_trainer.py
+  -> AgentLoopManager.generate_sequences()
+    -> AgentLoopWorker
+      -> AsyncLLMServerManager.generate()
+        -> vLLMOmniHttpServer.generate.remote()
+```
+
+不是：
+
+```text
+ActorRolloutRefWorker.generate_sequences()
+```
+
+**init_model() 里和 rollout 相关的部分**
+
+`init_model()` 会先构建 actor FSDP 模型：
+
+```python
+self.actor_module_fsdp = self._build_model_optimizer(...)
+```
+
+然后如果 `_is_rollout`：
+
+```python
+self._build_rollout(...)
+```
+
+所以训练 worker 启动时，它会同时准备：
+
+```text
+actor_module_fsdp: 训练用 FSDP 模型
+self.rollout: rollout adapter/wrapper
+```
+
+对 vLLM-Omni async 来说，`self.rollout` 主要用于后续 `update_weights`。
+
+**AsyncActorRolloutRefWorker.update_weights()**
+
+文件末尾：
+
+```python
+class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights(self, global_steps: int = None):
+        await self.rollout_mode()
+        return True
+```
+
+这个非常重要。
+
+在 async rollout 模式下，trainer 每轮训练后需要让 rollout server 更新权重。它会调用 worker 的：
+
+```python
+update_weights()
+```
+
+而这个函数只是：
+
+```python
+await self.rollout_mode()
+```
+
+也就是触发刚才说的权重收集和同步。
+
+所以 async 路径中，`fsdp_workers.py` 里最关键的 rollout 函数其实是：
+
+```python
+rollout_mode()
+```
+
+不是 `generate_sequences()`。
+
+**和 vLLMOmniHttpServer 的分工**
+
+可以这样理解：
+
+```text
+ActorRolloutRefWorker / fsdp_workers.py:
+  - 持有 FSDP 训练模型
+  - 训练 actor
+  - 收集当前权重
+  - 通过 self.rollout.update_weights(...) 同步到 rollout server
+
+vLLMOmniHttpServer:
+  - 持有 AsyncOmni
+  - 实际执行 generate
+  - 接收权重更新 RPC
+  - sleep/wake/clear cache
+```
+
+所以当前 async vLLM-Omni 的完整关系是：
+
+```text
+训练阶段:
+  ActorRolloutRefWorker.update_actor()
+
+权重同步:
+  AsyncActorRolloutRefWorker.update_weights()
+    -> rollout_mode()
+      -> self.actor_module_fsdp.state_dict()
+      -> self.rollout.update_weights(...)
+      -> vLLMOmniHttpServer.collective_rpc("update_weights_from_ipc")
+      -> AsyncOmni engine 更新权重
+
+生成阶段:
+  AgentLoopManager.generate_sequences()
+    -> AgentLoopWorker
+      -> vLLMOmniHttpServer.generate.remote()
+        -> AsyncOmni.generate()
+```
+
+一句话总结：`fsdp_workers.py` 里的 rollout 函数，在你的 vLLM-Omni async demo 里主要不是负责生成，而是负责 **在 FSDP 训练 worker 侧构建 rollout adapter，并把 actor 的最新权重同步给真正负责 generate 的 vLLM-Omni server**。
+### alpamayo 模型 Warpper
+模型的Config类主要用途为解析模型文件夹中的config.json等配置文件，为模型本体类提供具体配置。
+原alpamayo类`AlpamayoR1`无`forward`等一系列 HF 模型接口，无法注册为 HF 模型。
+`convert_release_config_to_training.py`的主要功能是把原始 alpamayo 模型文件夹中的config.json等配置文件转换成一个新的 config 文件，这个新 config 文件的结构和内容是基于 HF 模型设计的，包含了模型架构、预处理信息等必要配置，使得后续的模型 wrapper 可以基于这个新 config 来构建符合 HF 接口规范的模型类。比如其中明确了让 vlm_name_or_path 指向本地 Cosmos-Reason2-8B，这些信息是原始 config 文件里没有的，需要通过这个转换脚本来补全。
+`RLWrapperReasoningVLA`继承`ReasoningVLA`，即alpamayo的架构，但新增了符合 HF 模型接口规范的`forward`等方法，使得这个 wrapper 模型可以被注册成 HF 模型。
+`RLWrapperReasoningVLAConfig`继承`ReasoningVLAConfig`，主要是实现了在vllm适配时需要的工具函数以及增加了`RLWrapperReasoningVLA`要实现的`forward`等方法需要的配置项。
 ### alpamayo vllm 适配
 vllm 相关适配文件在 examples\alpamayo_demo 目录下：
 ```
@@ -2791,6 +3226,430 @@ demo3 当前为了单机 8 卡避免额外 GPU，走的就是这个 colocate 路
 有 reward model + colocate：
   rollout 先生成，trainer 后处理阶段 sleep actor，再调用 RM 计算 reward。
 ```
+### verl 中 sleep 函数的具体实现
+在 verl 里确实有实现，而且分成两套：
+
+1. **rollout model 的 sleep / wake_up**
+2. **reward model 的 sleep / wake_up**
+
+比如 verl 中的：
+
+```python
+checkpoint_manager.sleep_replicas()
+batch_reward = self._compute_reward_colocate(batch)
+```
+
+主要涉及这两套机制的配合。
+
+**1. `checkpoint_manager.sleep_replicas()` 在哪里实现**
+
+实现在：
+
+[verl/checkpoint_engine/base.py](verl/checkpoint_engine/base.py#L399)
+
+```python
+@auto_await
+async def sleep_replicas(self):
+    """Sleep all rollout replicas: free weight and kv_cache device memory."""
+    await asyncio.gather(*[r.sleep() for r in self.replicas])
+```
+
+对应的 wake up 也在同一个类里：
+
+[verl/checkpoint_engine/base.py](verl/checkpoint_engine/base.py#L404)
+
+```python
+@auto_await
+async def wake_up_replicas(self):
+    """Resume all rollout replicas: recover kv_cache and weights device memory."""
+    await asyncio.gather(*[r.wake_up() for r in self.replicas])
+```
+
+这里的 `self.replicas` 是 rollout replicas，也就是 async rollout manager 里的 vLLM / SGLang / TRT-LLM 推理副本。
+
+注意：`CheckpointEngineManager` 名字里有 checkpoint，但这里不只是保存 checkpoint，它也负责 **trainer actor 权重同步到 rollout engine**，所以也顺便管理 rollout replicas 的 sleep / wake。
+
+**2. `replica.sleep()` 具体干什么**
+
+`CheckpointEngineManager.sleep_replicas()` 会调用每个 `RolloutReplica.sleep()`。
+
+位置：
+
+[verl/workers/rollout/replica.py](verl/workers/rollout/replica.py#L281)
+
+```python
+async def sleep(self):
+    """Sleep each rollout server."""
+    await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+```
+
+也就是说它继续调用每个 rollout server 的 `sleep()`。
+
+以 vLLM 为例，具体实现在：
+
+[verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py#L568)
+
+```python
+async def sleep(self):
+    if self.node_rank != 0 or not self.config.free_cache_engine:
+        return
+
+    if self.rollout_mode == RolloutMode.HYBRID:
+        await self._sleep_hybrid()
+    elif self.rollout_mode == RolloutMode.COLOCATED:
+        await self.engine.sleep(level=1)
+    elif self.rollout_mode == RolloutMode.STANDALONE:
+        logger.info("skip sleep in standalone mode")
+```
+
+所以对 vLLM 来说：
+
+- 如果 `free_cache_engine=False`，`sleep()` 基本是 no-op。
+- 如果是 colocated rollout，调用 vLLM engine 的 `sleep(level=1)`。
+- 目的主要是释放 rollout engine 的 GPU cache / 部分显存，避免和 reward model / actor update 抢显存。
+
+对应 wake up：
+
+[verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py#L554)
+
+```python
+async def wake_up(self):
+    if self.node_rank != 0:
+        return
+
+    if self.rollout_mode == RolloutMode.HYBRID:
+        raise ValueError(...)
+    elif self.rollout_mode == RolloutMode.COLOCATED:
+        await self.engine.wake_up(tags=self._get_wake_up_tags())
+        await self.engine.reset_prefix_cache()
+    elif self.rollout_mode == RolloutMode.STANDALONE:
+        logger.info("skip wake_up in standalone mode")
+```
+
+默认 wake up tags 是：
+
+[verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py#L849)
+
+```python
+def _get_wake_up_tags(self) -> list[str]:
+    return ["kv_cache", "weights"]
+```
+
+也就是恢复：
+
+```text
+kv_cache + weights
+```
+
+**3. 为什么代码里常用 `update_weights()` 而不是直接 `wake_up_replicas()`**
+
+`wake_up_replicas()` 确实存在，但在 PPO trainer 里很多地方不是直接调用它，而是调用：
+
+```python
+self.checkpoint_manager.update_weights(self.global_steps)
+```
+
+例如：
+
+[verl/trainer/ppo/ray_trainer.py](verl/trainer/ppo/ray_trainer.py#L598)
+
+```python
+self.checkpoint_manager.sleep_replicas()
+batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
+test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+self.checkpoint_manager.update_weights(self.global_steps)
+```
+
+原因是：训练过程中 wake rollout 往往不仅是“恢复显存”，还要把最新 actor 权重同步到 rollout engine。
+
+`update_weights()` 内部流程是：
+
+[verl/checkpoint_engine/base.py](verl/checkpoint_engine/base.py#L408)
+
+简化后是：
+
+```python
+await self.sleep_replicas()
+self.build_process_group(...)
+ray.get(trainer.update_weights(...) + rollout.update_weights(...))
+await self.wake_up_replicas()
+await replica.resume_generation()
+```
+
+所以 `update_weights()` 等价于：
+
+```text
+sleep rollout
+同步 trainer actor 权重到 rollout engine
+wake rollout
+恢复未完成 rollout 请求
+```
+
+因此在训练主循环里，通常用 `update_weights()` 来重新唤醒 rollout，而不是单独 `wake_up_replicas()`。
+
+**4. `_compute_reward_colocate(batch)` 在哪里实现**
+
+原生 PPO trainer 里：
+
+[verl/trainer/ppo/ray_trainer.py](verl/trainer/ppo/ray_trainer.py#L541)
+
+```python
+def _compute_reward_colocate(self, batch: DataProto):
+    assert self.reward_loop_manager is not None
+    batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+    return batch_reward
+```
+
+它只是转发到：
+
+```python
+RewardLoopManager.compute_rm_score()
+```
+
+实现位置：
+
+[verl/experimental/reward_loop/reward_loop.py](verl/experimental/reward_loop/reward_loop.py#L343)
+
+```python
+def compute_rm_score(self, data: DataProto) -> DataProto:
+    if self.reward_model_manager is not None:
+        self.reward_model_manager.wake_up()
+
+    chunks = data.chunk(len(self.reward_loop_workers))
+    outputs = ray.get([
+        worker.compute_score_batch.remote(chunk)
+        ...
+    ])
+
+    ...
+
+    if self.reward_model_manager is not None:
+        self.reward_model_manager.sleep()
+
+    return DataProto(...)
+```
+
+这说明 `_compute_reward_colocate()` 会：
+
+1. wake up reward model
+2. 让 reward workers 计算 reward
+3. sleep reward model
+4. 返回 `rm_scores` 和 reward extra info
+
+**5. reward model 的 sleep / wake_up 在哪里**
+
+reward model manager 在：
+
+[verl/experimental/reward_loop/reward_model.py](verl/experimental/reward_loop/reward_model.py#L103)
+
+```python
+def wake_up(self):
+    """Wake up all rollout replica instances."""
+    self._run_all([replica.wake_up() for replica in self.rollout_replicas])
+
+def sleep(self):
+    """Sleep all rollout replica instances."""
+    self._run_all([replica.sleep() for replica in self.rollout_replicas])
+```
+
+这里 reward model 本身也是通过 rollout replica 机制起的 vLLM server，所以它复用了 rollout replica 的 `sleep/wake_up` 抽象。
+
+**6. 放在一起看，colocate reward model 的显存切换流程是**
+
+在 `reward.reward_model.enable=True` 且 colocate 的情况下，大致是：
+
+```text
+1. rollout model wake
+2. actor rollout 生成 response
+3. checkpoint_manager.sleep_replicas()
+   -> sleep rollout model，释放 rollout cache / 显存
+
+4. _compute_reward_colocate(batch)
+   -> reward_model_manager.wake_up()
+   -> reward worker 调 reward_fn / reward model
+   -> reward_model_manager.sleep()
+
+5. 后面 update actor
+
+6. checkpoint_manager.update_weights()
+   -> 同步 actor 最新权重到 rollout engine
+   -> wake rollout model
+```
+
+所以这两个调用的含义是：
+
+```python
+checkpoint_manager.sleep_replicas()
+```
+
+让 **rollout model** 休眠，腾出 colocate GPU 资源。
+
+```python
+batch_reward = self._compute_reward_colocate(batch)
+```
+
+让 **reward model** 临时 wake up，计算 reward，然后再 sleep。
+
+**7. self.engine.sleep(level=1) 的具体实现**
+`self.engine.sleep(level=1)` **不是 verl 自己实现的**，而是调用到 **vLLM V1 的 `AsyncLLM.sleep()`**。
+
+在 verl 里，`self.engine` 是这样来的：
+
+[verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py#L375)
+
+```python
+engine_client = AsyncLLM.from_vllm_config(...)
+...
+self.engine = engine_client
+```
+
+所以这里：
+
+[verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py#L568)
+
+```python
+elif self.rollout_mode == RolloutMode.COLOCATED:
+    await self.engine.sleep(level=1)
+```
+
+实际调用链是：
+
+```text
+verl vLLMHttpServer.sleep()
+        |
+        v
+vllm.v1.engine.async_llm.AsyncLLM.sleep(level=1)
+        |
+        v
+engine_core.sleep_async(level)
+        |
+        v
+EngineCore.sleep(level)
+        |
+        v
+model_executor.sleep(level)
+        |
+        v
+Executor.collective_rpc("sleep", level=1)
+        |
+        v
+每个 GPU Worker.sleep(level=1)
+        |
+        v
+CuMemAllocator.sleep(offload_tags=("weights",))
+```
+
+**vLLM 里的实现**
+
+官方 vLLM docs 里 `AsyncLLM.sleep()` 是：
+
+```python
+async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
+    await self.engine_core.sleep_async(level, mode)
+```
+
+见 [vLLM AsyncLLM docs](https://docs.vllm.ai/en/latest/api/vllm/v1/engine/async_llm/)。
+
+再往下一层，`engine_core.sleep_async()` 会调用 utility：
+
+```python
+async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+    await self.call_utility_async("sleep", level, mode)
+```
+
+见 [vLLM core_client docs](https://vllm.website.cncfstack.com/api/vllm/v1/engine/core_client/)。
+
+真正的 EngineCore 逻辑是：
+
+```python
+def sleep(self, level: int = 1, mode: PauseMode = "abort"):
+    clear_prefix_cache = level >= 1
+    pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
+
+    if level < 1:
+        return pause_future
+
+    model_executor = self.model_executor
+    ...
+    model_executor.sleep(level)
+```
+
+见 [vLLM EngineCore docs](https://docs.vllm.ai/en/stable/api/vllm/v1/engine/core.html)。
+
+也就是说，`sleep(level=1)` 会先暂停 scheduler，并清理 prefix cache / KV cache，然后把显存管理交给 executor。
+
+**最底层 Worker 做什么**
+
+vLLM GPU worker 的 `sleep()` 大致是：
+
+```python
+def sleep(self, level: int = 1) -> None:
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+
+    if level == 2:
+        model = self.model_runner.model
+        self._sleep_saved_buffers = {
+            name: buffer.cpu().clone()
+            for name, buffer in model.named_buffers()
+        }
+
+    allocator = CuMemAllocator.get_instance()
+    allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+
+    free_bytes_after_sleep, total = torch.cuda.mem_get_info()
+```
+
+见 [vLLM GPU worker docs](https://docs.vllm.ai/en/stable/api/vllm/v1/worker/gpu_worker/)。
+
+这里 `level=1` 的核心就是：
+
+```python
+allocator.sleep(offload_tags=("weights",))
+```
+
+含义是：
+
+```text
+把 weights 从 GPU offload 到 CPU memory
+丢弃 KV cache
+释放对应 GPU 显存
+```
+
+vLLM 官方 sleep mode 文档也说明：
+
+- `level=1`：offload model weights 到 CPU，discard KV cache。
+- `level=2`：discard model weights 和 KV cache，保留少量 buffer。
+- `wake_up(tags=["weights"])` 可以只恢复 weights。
+- `wake_up(tags=["kv_cache"])` 可以只恢复 KV cache。
+
+见 [vLLM Sleep Mode docs](https://vllm.website.cncfstack.com/features/sleep_mode/)。
+
+**所以在 verl 里的意义**
+
+在你的 colocate 场景中：
+
+```python
+await self.engine.sleep(level=1)
+```
+
+不是简单 `torch.cuda.empty_cache()`，而是调用 vLLM 的 sleep mode：
+
+```text
+rollout vLLM engine 暂停调度
+清掉 KV/cache
+把 rollout model weights offload 到 CPU
+释放 GPU 显存
+```
+
+然后 reward model 可以 wake up，占用这部分 GPU 显存来算 reward。等后面调用：
+
+```python
+checkpoint_manager.update_weights(...)
+```
+
+或 `wake_up_replicas()` 时，vLLM 再把需要的资源恢复回来。
 ### 运行 reward 曲线
 ![](./imgs/verl/reward曲线.png)
 
